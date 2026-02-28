@@ -1,0 +1,7 @@
+[project]
+name = "perry-hub"
+entry = "src/main.ts"
+
+[app]
+name = "perry-hub"
+version = "0.1.0"
