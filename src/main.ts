@@ -5,6 +5,7 @@ import Fastify from 'fastify';
 import * as fs from 'fs';
 import * as crypto from 'crypto';
 import { WebSocketServer, sendToClient, closeClient } from 'ws';
+import mysql from 'mysql2/promise';
 
 // --- Multipart parser (pure TypeScript) ---
 
@@ -93,8 +94,24 @@ function isSelfHosted(): boolean {
 }
 const TARBALL_DIR = '/tmp/perry-hub-tarballs';
 const ARTIFACT_DIR = '/tmp/perry-artifacts';
-const LICENSE_DIR = '/var/lib/perry-hub';
-const LICENSE_FILE = '/var/lib/perry-hub/licenses.json';
+
+// --- Database pool ---
+// createPool must be called inside a function (not inline at module level)
+// for perry to properly pass the object literal to the native mysql2 FFI.
+// The returned pool must be assigned to a named const so perry's HIR
+// transform can track it as a mysql2 Pool for method dispatch.
+
+function createDbPool(): Pool {
+  return mysql.createPool({
+    host: 'localhost',
+    port: 3306,
+    user: 'perry',
+    password: 'perry',
+    database: 'perry_hub',
+  });
+}
+
+const db = createDbPool();
 
 // --- Types ---
 
@@ -116,7 +133,6 @@ interface Job {
   tier: 'free' | 'pro';
   manifest: any;
   credentials: any;
-  tarball_path: string;
   status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
   created_at: number;
   priority: number;
@@ -204,6 +220,86 @@ function removeClient(handle: any): void {
   clientWorkerIdx.delete(key);
 }
 
+// --- DB init and helpers ---
+
+async function initDb(): Promise<void> {
+  try {
+    await db.query(`CREATE TABLE IF NOT EXISTS licenses (
+      licenseKey VARCHAR(64) PRIMARY KEY,
+      tier VARCHAR(8) NOT NULL DEFAULT 'free',
+      githubUsername VARCHAR(255) NOT NULL DEFAULT '',
+      platforms TEXT NOT NULL,
+      createdAt BIGINT NOT NULL,
+      notes TEXT
+    )`);
+
+    await db.query(`CREATE TABLE IF NOT EXISTS builds (
+      id CHAR(36) PRIMARY KEY,
+      licenseKey VARCHAR(64) NOT NULL,
+      tier VARCHAR(8) NOT NULL,
+      targets TEXT NOT NULL,
+      status VARCHAR(20) NOT NULL DEFAULT 'queued',
+      queuedAt BIGINT NOT NULL,
+      startedAt BIGINT,
+      completedAt BIGINT,
+      durationSecs INT,
+      workerName VARCHAR(255),
+      errorMessage TEXT,
+      INDEX idxLicenseKey (licenseKey)
+    )`);
+
+    const result = await db.query('SELECT licenseKey, tier, githubUsername, platforms FROM licenses');
+    const rows: any = result[0];
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      const license: License = {
+        key: row.licenseKey,
+        tier: row.tier,
+        github_username: row.githubUsername,
+        platforms: JSON.parse(row.platforms),
+      };
+      licenses.set(license.key, license);
+    }
+    console.log('DB ready, loaded ' + String(licenses.size) + ' licenses');
+  } catch (e: any) {
+    console.error('DB init error:', e.message || e);
+  }
+}
+
+async function dbSaveLicense(license: License): Promise<void> {
+  try {
+    await db.execute(
+      'INSERT INTO licenses (licenseKey, tier, githubUsername, platforms, createdAt) VALUES (?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE tier=VALUES(tier), platforms=VALUES(platforms)',
+      [license.key, license.tier, license.github_username, JSON.stringify(license.platforms), Date.now()]
+    );
+  } catch (e: any) {
+    console.error('dbSaveLicense error:', e.message || e);
+  }
+}
+
+function dbInsertBuild(job: Job): void {
+  const targets = job.manifest && job.manifest.targets ? JSON.stringify(job.manifest.targets) : '[]';
+  db.execute(
+    'INSERT INTO builds (id, licenseKey, tier, targets, status, queuedAt) VALUES (?, ?, ?, ?, ?, ?)',
+    [job.id, job.license_key, job.tier, targets, 'queued', job.created_at]
+  );
+}
+
+function dbBuildStarted(jobId: string, workerName: string): void {
+  db.execute(
+    'UPDATE builds SET status=?, startedAt=?, workerName=? WHERE id=?',
+    ['running', Date.now(), workerName, jobId]
+  );
+}
+
+function dbBuildFinished(jobId: string, success: boolean, durationSecs: number, errorMsg: string): void {
+  const status = success ? 'completed' : 'failed';
+  db.execute(
+    'UPDATE builds SET status=?, completedAt=?, durationSecs=?, errorMessage=? WHERE id=?',
+    [status, Date.now(), durationSecs, errorMsg, jobId]
+  );
+}
+
 // --- License store ---
 
 function generateLicenseKey(tier: 'free' | 'pro'): string {
@@ -224,34 +320,6 @@ function registerLicense(username: string, tier: 'free' | 'pro'): License {
   const license: License = { key, tier, github_username: username, platforms };
   licenses.set(key, license);
   return license;
-}
-
-function saveLicenses(): void {
-  try {
-    const arr: License[] = [];
-    licenses.forEach((license: License) => {
-      arr.push(license);
-    });
-    fs.writeFileSync(LICENSE_FILE, JSON.stringify(arr));
-  } catch (e) {
-    console.error('Failed to save licenses:', e);
-  }
-}
-
-function loadLicenses(): void {
-  try {
-    if (fs.existsSync(LICENSE_FILE)) {
-      const data = fs.readFileSync(LICENSE_FILE, 'utf-8');
-      const arr = JSON.parse(data) as License[];
-      for (let li = 0; li < arr.length; li++) {
-        const license = arr[li];
-        licenses.set(license.key, license);
-      }
-      console.log('Loaded ' + String(arr.length) + ' licenses from disk');
-    }
-  } catch (e) {
-    console.error('Failed to load licenses:', e);
-  }
 }
 
 function verifyLicense(key: string): License | null {
@@ -377,6 +445,7 @@ function dispatchJob(job: Job): boolean {
   worker.busy = true;
   worker.current_job_id = job.id;
   job.status = 'running';
+  dbBuildStarted(job.id, worker.name);
 
   try {
     sendToClient(worker.clientHandle, JSON.stringify({
@@ -384,7 +453,7 @@ function dispatchJob(job: Job): boolean {
       job_id: job.id,
       manifest: job.manifest,
       credentials: job.credentials,
-      tarball_path: job.tarball_path,
+      tarball_url: getPublicUrl() + '/api/v1/tarball/' + job.id,
     }));
   } catch (e) {
     worker.busy = false;
@@ -516,12 +585,17 @@ async function verifyGitHubToken(token: string): Promise<string> {
 
 try { fs.mkdirSync(TARBALL_DIR, { recursive: true }); } catch (e) { /* exists */ }
 try { fs.mkdirSync(ARTIFACT_DIR, { recursive: true }); } catch (e) { /* exists */ }
-try { fs.mkdirSync(LICENSE_DIR, { recursive: true }); } catch (e) { /* exists */ }
-loadLicenses();
+initDb();
 
 // --- Fastify HTTP server ---
 
-const app = Fastify({ bodyLimit: 200 * 1024 * 1024 });
+// 400MB body limit to accommodate base64-encoded tarballs (~33% overhead over binary)
+const app = Fastify({ bodyLimit: 400 * 1024 * 1024 });
+
+function getPublicUrl(): string {
+  const v = process.env.PERRY_HUB_PUBLIC_URL || '';
+  return v || 'https://hub.perryts.com';
+}
 
 // GET /api/v1/status
 app.get('/api/v1/status', async (request: any, reply: any) => {
@@ -538,7 +612,7 @@ app.post('/api/v1/license/register', async (request: any, reply: any) => {
 
   const username = body.github_username || '';
   const license = registerLicense(username, 'free');
-  saveLicenses();
+  await dbSaveLicense(license);
   return JSON.stringify({
     license_key: license.key,
     tier: license.tier,
@@ -588,13 +662,13 @@ app.post('/api/v1/build', async (request: any, reply: any) => {
   let licensePart: MultipartPart | null = null;
   let manifestPart: MultipartPart | null = null;
   let credentialsPart: MultipartPart | null = null;
-  let projectPathPart: MultipartPart | null = null;
+  let tarballB64Part: MultipartPart | null = null;
   for (let pi = 0; pi < parts.length; pi++) {
     const p = parts[pi];
     if (p.name === 'license_key') licensePart = p;
     else if (p.name === 'manifest') manifestPart = p;
     else if (p.name === 'credentials') credentialsPart = p;
-    else if (p.name === 'project_path') projectPathPart = p;
+    else if (p.name === 'tarball_b64') tarballB64Part = p;
   }
 
   if (!licensePart) {
@@ -605,9 +679,9 @@ app.post('/api/v1/build', async (request: any, reply: any) => {
     reply.status(400);
     return JSON.stringify({ error: { code: 'BAD_REQUEST', message: "Missing 'manifest' field" } });
   }
-  if (!projectPathPart) {
+  if (!tarballB64Part) {
     reply.status(400);
-    return JSON.stringify({ error: { code: 'BAD_REQUEST', message: "Missing 'project_path' field" } });
+    return JSON.stringify({ error: { code: 'BAD_REQUEST', message: "Missing 'tarball_b64' field" } });
   }
 
   const licenseKey = licensePart.data;
@@ -616,13 +690,6 @@ app.post('/api/v1/build', async (request: any, reply: any) => {
   let credentials: any = {};
   if (credentialsPart) {
     credentials = JSON.parse(credentialsPart.data);
-  }
-
-  // Use the tarball path directly from the CLI (avoids binary corruption in text-based body parsing)
-  const tarballPath = projectPathPart.data.trim();
-  if (!fs.existsSync(tarballPath)) {
-    reply.status(400);
-    return JSON.stringify({ error: { code: 'BAD_REQUEST', message: 'Tarball not found at path: ' + tarballPath } });
   }
 
   // Validate license
@@ -641,28 +708,32 @@ app.post('/api/v1/build', async (request: any, reply: any) => {
     }
   }
 
-  // Create and enqueue job
+  // Save tarball base64 to disk so workers can download it
   const jobId = crypto.randomUUID();
+  const tarballB64Path = TARBALL_DIR + '/' + jobId + '.b64';
+  fs.writeFileSync(tarballB64Path, tarballB64Part.data);
+
+  // Create and enqueue job
   const job: Job = {
     id: jobId,
     license_key: license.key,
     tier: license.tier,
     manifest,
     credentials,
-    tarball_path: tarballPath,
     status: 'queued',
     created_at: Date.now(),
     priority: license.tier === 'pro' ? 10 : 1,
   };
 
   const position = enqueueJob(job);
+  dbInsertBuild(job);
 
   // Try to dispatch immediately
   tryDispatchNext();
 
   return JSON.stringify({
     job_id: jobId,
-    ws_url: `ws://localhost:${WS_PORT}`,
+    ws_url: '/ws',
     position,
   });
 });
@@ -688,6 +759,21 @@ app.get('/api/v1/dl/:token', async (request: any, reply: any) => {
     reply.status(500);
     reply.header('Content-Type', 'application/json');
     return JSON.stringify({ error: { code: 'INTERNAL_ERROR', message: 'Failed to read artifact: ' + (e.message || e) } });
+  }
+});
+
+// GET /api/v1/tarball/:jobId — workers download the base64-encoded tarball for a job
+app.get('/api/v1/tarball/:jobId', async (request: any, reply: any) => {
+  const jobId = request.params.jobId;
+  const b64Path = TARBALL_DIR + '/' + jobId + '.b64';
+  try {
+    const b64Data = fs.readFileSync(b64Path);
+    reply.header('Content-Type', 'text/plain');
+    return b64Data;
+  } catch (e: any) {
+    reply.status(404);
+    reply.header('Content-Type', 'application/json');
+    return JSON.stringify({ error: { code: 'NOT_FOUND', message: 'Tarball not found for job: ' + jobId } });
   }
 });
 
@@ -867,6 +953,10 @@ function handleWorkerMessage(msg: any, worker: WorkerInfo): void {
         job.status = 'failed';
       }
       releaseRateLimit(job.license_key);
+      const durationSecs = Math.round((Date.now() - job.created_at) / 1000);
+      dbBuildFinished(jobId, msg.success, durationSecs, msg.error || '');
+      // Clean up tarball b64 file now that the worker is done with it
+      try { fs.unlinkSync(TARBALL_DIR + '/' + jobId + '.b64'); } catch (e) { /* ignore */ }
     }
 
     const completeJson = JSON.stringify(msg);
