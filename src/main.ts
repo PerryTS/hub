@@ -50,7 +50,8 @@ function parseMultipart(body: string, contentType: string): MultipartPart[] {
     let partContentType: string | undefined;
 
     const lines = headerSection.split('\r\n');
-    for (const line of lines) {
+    for (let li = 0; li < lines.length; li++) {
+      const line = lines[li];
       const trimmed = line.trim();
       if (!trimmed) continue;
 
@@ -92,8 +93,8 @@ function isSelfHosted(): boolean {
 }
 const TARBALL_DIR = '/tmp/perry-hub-tarballs';
 const ARTIFACT_DIR = '/tmp/perry-artifacts';
-const LICENSE_DIR = '/tmp/perry-hub-data';
-const LICENSE_FILE = '/tmp/perry-hub-data/licenses.json';
+const LICENSE_DIR = '/var/lib/perry-hub';
+const LICENSE_FILE = '/var/lib/perry-hub/licenses.json';
 
 // --- Types ---
 
@@ -242,7 +243,8 @@ function loadLicenses(): void {
     if (fs.existsSync(LICENSE_FILE)) {
       const data = fs.readFileSync(LICENSE_FILE, 'utf-8');
       const arr = JSON.parse(data) as License[];
-      for (const license of arr) {
+      for (let li = 0; li < arr.length; li++) {
+        const license = arr[li];
         licenses.set(license.key, license);
       }
       console.log('Loaded ' + String(arr.length) + ' licenses from disk');
@@ -330,7 +332,8 @@ function dequeueJob(): Job | null {
 // --- Worker pool ---
 
 function getAvailableWorker(requiredCapabilities: string[]): WorkerInfo | null {
-  for (const worker of workerList) {
+  for (let wi = 0; wi < counters.workers; wi++) {
+    const worker = workerList[wi];
     if (!worker.busy) {
       const hasAll = requiredCapabilities.every(cap => worker.capabilities.includes(cap));
       if (hasAll) {
@@ -343,9 +346,11 @@ function getAvailableWorker(requiredCapabilities: string[]): WorkerInfo | null {
 
 function getSupportedTargets(): string[] {
   const targets = new Set<string>();
-  for (const worker of workerList) {
-    for (const cap of worker.capabilities) {
-      targets.add(cap);
+  for (let wi = 0; wi < counters.workers; wi++) {
+    const worker = workerList[wi];
+    const caps = worker.capabilities;
+    for (let ci = 0; ci < caps.length; ci++) {
+      targets.add(caps[ci]);
     }
   }
   return Array.from(targets);
@@ -355,8 +360,9 @@ function dispatchJob(job: Job): boolean {
   // Determine required capabilities from manifest targets
   const requiredCaps: string[] = [];
   if (job.manifest.targets) {
-    for (const t of job.manifest.targets) {
-      requiredCaps.push(t.toLowerCase());
+    const manifestTargets = job.manifest.targets;
+    for (let ti = 0; ti < manifestTargets.length; ti++) {
+      requiredCaps.push(manifestTargets[ti].toLowerCase());
     }
   }
   if (requiredCaps.length === 0) {
@@ -439,7 +445,8 @@ function startArtifactCleanup(): void {
         expired.push(token);
       }
     });
-    for (const token of expired) {
+    for (let ei = 0; ei < expired.length; ei++) {
+      const token = expired[ei];
       const entry = artifacts.get(token);
       if (entry) {
         try { fs.unlinkSync(entry.path); } catch (e) { /* ignore */ }
@@ -467,7 +474,8 @@ function sendToAllCliClients(jobId: string, json: string): void {
   const handleStr = jobCliHandles.get(jobId) || '';
   if (!handleStr) return;
   const parts = handleStr.split(',');
-  for (const hStr of parts) {
+  for (let pi = 0; pi < parts.length; pi++) {
+    const hStr = parts[pi];
     if (!hStr) continue;
     const h = Number(hStr);
     try {
@@ -526,14 +534,7 @@ app.get('/api/v1/status', async (request: any, reply: any) => {
 // POST /api/v1/license/register
 app.post('/api/v1/license/register', async (request: any, reply: any) => {
   reply.header('Content-Type', 'application/json');
-  let body: any = {};
-  try {
-    if (request.body) {
-      body = JSON.parse(request.body);
-    }
-  } catch (e) {
-    // Accept empty or invalid body — no fields required
-  }
+  let body: any = request.body || {};
 
   const username = body.github_username || '';
   const license = registerLicense(username, 'free');
@@ -548,10 +549,8 @@ app.post('/api/v1/license/register', async (request: any, reply: any) => {
 // POST /api/v1/license/verify
 app.post('/api/v1/license/verify', async (request: any, reply: any) => {
   reply.header('Content-Type', 'application/json');
-  let body: any;
-  try {
-    body = JSON.parse(request.body);
-  } catch (e) {
+  const body: any = request.body;
+  if (!body) {
     reply.status(400);
     return JSON.stringify({ error: { code: 'BAD_REQUEST', message: 'Invalid JSON body' } });
   }
@@ -567,27 +566,36 @@ app.post('/api/v1/license/verify', async (request: any, reply: any) => {
 // POST /api/v1/build
 app.post('/api/v1/build', async (request: any, reply: any) => {
   reply.header('Content-Type', 'application/json');
-  const hdrs = JSON.parse(request.headers);
+  const hdrs = request.headers;
   const contentType = hdrs['content-type'] || '';
   if (!contentType.includes('multipart/form-data')) {
     reply.status(400);
     return JSON.stringify({ error: { code: 'BAD_REQUEST', message: 'Expected multipart/form-data' } });
   }
 
-  // Parse multipart body
+  // Parse multipart body (request.text = raw body string from perry runtime)
+  const rawBody = request.text;
   let parts: MultipartPart[];
   try {
-    parts = parseMultipart(request.body, contentType);
+    parts = parseMultipart(rawBody, contentType);
   } catch (e: any) {
     reply.status(400);
     return JSON.stringify({ error: { code: 'BAD_REQUEST', message: 'Failed to parse multipart body: ' + (e.message || e) } });
   }
 
-  // Extract fields
-  const licensePart = parts.find((p: any) => p.name === 'license_key');
-  const manifestPart = parts.find((p: any) => p.name === 'manifest');
-  const credentialsPart = parts.find((p: any) => p.name === 'credentials');
-  const projectPathPart = parts.find((p: any) => p.name === 'project_path');
+  // Extract fields - use index loop (not .find()) to avoid perry closure issues
+  // Use truthiness checks (not !== null) since perry's null comparison is broken
+  let licensePart: MultipartPart | null = null;
+  let manifestPart: MultipartPart | null = null;
+  let credentialsPart: MultipartPart | null = null;
+  let projectPathPart: MultipartPart | null = null;
+  for (let pi = 0; pi < parts.length; pi++) {
+    const p = parts[pi];
+    if (p.name === 'license_key') licensePart = p;
+    else if (p.name === 'manifest') manifestPart = p;
+    else if (p.name === 'credentials') credentialsPart = p;
+    else if (p.name === 'project_path') projectPathPart = p;
+  }
 
   if (!licensePart) {
     reply.status(400);
@@ -603,22 +611,11 @@ app.post('/api/v1/build', async (request: any, reply: any) => {
   }
 
   const licenseKey = licensePart.data;
-  let manifest: any;
-  try {
-    manifest = JSON.parse(manifestPart.data);
-  } catch (e) {
-    reply.status(400);
-    return JSON.stringify({ error: { code: 'BAD_REQUEST', message: 'Invalid manifest JSON' } });
-  }
+  const manifest = JSON.parse(manifestPart.data);
 
   let credentials: any = {};
   if (credentialsPart) {
-    try {
-      credentials = JSON.parse(credentialsPart.data);
-    } catch (e) {
-      reply.status(400);
-      return JSON.stringify({ error: { code: 'BAD_REQUEST', message: 'Invalid credentials JSON' } });
-    }
+    credentials = JSON.parse(credentialsPart.data);
   }
 
   // Use the tarball path directly from the CLI (avoids binary corruption in text-based body parsing)
@@ -694,6 +691,7 @@ app.get('/api/v1/dl/:token', async (request: any, reply: any) => {
   }
 });
 
+// --- WebSocket server ---
 // --- WebSocket server ---
 // Uses server-level events (wss.on) instead of per-connection ws.on()
 // because perry's codegen can't compile ws.on() inside arrow callbacks.
@@ -890,7 +888,8 @@ function handleCliMessage(msg: any, clientHandle: any): void {
     const job = jobs.get(msg.job_id);
     if (job && job.status === 'running') {
       // Find the worker handling this job and send cancel
-      for (const worker of workerList) {
+      for (let wi = 0; wi < counters.workers; wi++) {
+        const worker = workerList[wi];
         if (worker.current_job_id === msg.job_id) {
           try {
             sendToClient(worker.clientHandle, JSON.stringify({ type: 'cancel', job_id: msg.job_id }));
