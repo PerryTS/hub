@@ -815,7 +815,7 @@ wss.on('message', (clientHandle: any, data: any) => {
         busy: false,
         current_job_id: null,
       };
-      workerList.push(workerInfo);
+      workerList[counters.workers] = workerInfo;  // avoid push() — corrupts values in perry
       setClientWorkerIdx(clientHandle, counters.workers);
       counters.workers++;
       console.log('Worker connected: ' + workerInfo.name);
@@ -890,12 +890,10 @@ wss.on('close', (clientHandle: any) => {
         }
       }
 
-      // Remove worker from list
-      workerList.splice(wIdx, 1);
+      // Remove worker from list — avoid splice() in perry, shift down manually
       counters.workers--;
-
-      // Update clientWorkerIdx for workers that shifted down after splice
       for (let wi = wIdx; wi < counters.workers; wi++) {
+        workerList[wi] = workerList[wi + 1];
         setClientWorkerIdx(workerList[wi].clientHandle, wi);
       }
     }
