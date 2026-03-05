@@ -454,6 +454,7 @@ function dispatchJob(job: Job): boolean {
       manifest: job.manifest,
       credentials: job.credentials,
       tarball_url: getPublicUrl() + '/api/v1/tarball/' + job.id,
+      artifact_upload_url: getPublicUrl() + '/api/v1/artifact/upload/' + job.id,
     }));
   } catch (e) {
     worker.busy = false;
@@ -775,7 +776,55 @@ app.get('/api/v1/tarball/:jobId', async (request: any, reply: any) => {
   }
 });
 
-// --- WebSocket server ---
+// POST /api/v1/artifact/upload/:jobId — workers upload built artifacts (base64-encoded)
+// Headers: x-artifact-name (filename), x-artifact-sha256 (checksum), x-artifact-target (platform)
+// Body: base64-encoded artifact data (text/plain)
+app.post('/api/v1/artifact/upload/:jobId', async (request: any, reply: any) => {
+  reply.header('Content-Type', 'application/json');
+  const jobId = request.params.jobId;
+  const hdrs = request.headers;
+  const artifactName = hdrs['x-artifact-name'] || 'artifact';
+  const sha256 = hdrs['x-artifact-sha256'] || '';
+  const target = hdrs['x-artifact-target'] || '';
+
+  const job = jobs.get(jobId);
+  if (!job) {
+    reply.status(404);
+    return JSON.stringify({ error: { code: 'JOB_NOT_FOUND', message: 'Job not found' } });
+  }
+  if (job.status !== 'running') {
+    reply.status(409);
+    return JSON.stringify({ error: { code: 'JOB_NOT_RUNNING', message: 'Job is not in running state' } });
+  }
+
+  const rawBody = request.text || request.body || '';
+  if (!rawBody || typeof rawBody !== 'string') {
+    reply.status(400);
+    return JSON.stringify({ error: { code: 'BAD_REQUEST', message: 'Missing base64 artifact data in body' } });
+  }
+
+  const b64Data = rawBody.trim();
+
+  // Decode base64 and write to artifact directory
+  const artifactId = crypto.randomUUID();
+  const artifactPath = ARTIFACT_DIR + '/' + artifactId;
+  const buffer = Buffer.from(b64Data, 'base64');
+  fs.writeFileSync(artifactPath, buffer);
+  const size = buffer.length;
+
+  // Register artifact with download token
+  const token = registerArtifact(artifactPath, artifactName, sha256, size);
+  const downloadUrl = getPublicUrl() + '/api/v1/dl/' + token;
+
+  // Notify CLI clients watching this job
+  const artJson = '{"type":"artifact_ready","job_id":"' + jobId + '","target":"' + target + '","artifact_name":"' + artifactName + '","artifact_size":' + String(size) + ',"sha256":"' + sha256 + '","download_url":"' + downloadUrl + '","expires_in_secs":' + String(ARTIFACT_TTL_SECS) + '}';
+  relayToCliClientsJson(jobId, artJson);
+
+  console.log('Artifact uploaded for job ' + jobId + ': ' + artifactName + ' (' + String(size) + ' bytes)');
+
+  return JSON.stringify({ token: token, download_url: downloadUrl, size: size });
+});
+
 // --- WebSocket server ---
 // Uses server-level events (wss.on) instead of per-connection ws.on()
 // because perry's codegen can't compile ws.on() inside arrow callbacks.
@@ -949,9 +998,10 @@ function handleWorkerMessage(msg: any, worker: WorkerInfo): void {
       msg.sha256,
       msg.size,
     );
-    const downloadUrl = '/api/v1/dl/' + token;
+    const downloadUrl = getPublicUrl() + '/api/v1/dl/' + token;
+    const target = msg.target || '';
 
-    const artJson = '{"type":"artifact_ready","artifact_name":"' + msg.artifact_name + '","artifact_size":' + String(msg.size) + ',"sha256":"' + msg.sha256 + '","download_url":"' + downloadUrl + '","expires_in_secs":' + String(ARTIFACT_TTL_SECS) + ',"download_path":"' + msg.path + '"}';
+    const artJson = '{"type":"artifact_ready","job_id":"' + jobId + '","target":"' + target + '","artifact_name":"' + msg.artifact_name + '","artifact_size":' + String(msg.size) + ',"sha256":"' + msg.sha256 + '","download_url":"' + downloadUrl + '","expires_in_secs":' + String(ARTIFACT_TTL_SECS) + '}';
     relayToCliClientsJson(jobId, artJson);
   } else if (msgType === 'complete') {
     if (!jobId) return;
