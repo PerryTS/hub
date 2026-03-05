@@ -547,9 +547,7 @@ function sendToAllCliClients(jobId: string, json: string): void {
     const hStr = parts[pi];
     if (!hStr) continue;
     const h = Number(hStr);
-    try {
-      sendToClient(h, json);
-    } catch (e) { /* ignore */ }
+    sendToClient(h, json);
   }
 }
 
@@ -895,6 +893,11 @@ wss.on('close', (clientHandle: any) => {
       // Remove worker from list
       workerList.splice(wIdx, 1);
       counters.workers--;
+
+      // Update clientWorkerIdx for workers that shifted down after splice
+      for (let wi = wIdx; wi < counters.workers; wi++) {
+        setClientWorkerIdx(workerList[wi].clientHandle, wi);
+      }
     }
   }
 
@@ -906,8 +909,18 @@ wss.on('close', (clientHandle: any) => {
       const existing = jobCliHandles.get(job.id) || '';
       if (existing.includes(hStr)) {
         const parts = existing.split(',');
-        const filtered = parts.filter((p: string) => p !== hStr);
-        jobCliHandles.set(job.id, filtered.join(','));
+        let newHandles = '';
+        for (let fi = 0; fi < parts.length; fi++) {
+          const p = parts[fi];
+          if (p && p !== hStr) {
+            if (newHandles) {
+              newHandles = newHandles + ',' + p;
+            } else {
+              newHandles = p;
+            }
+          }
+        }
+        jobCliHandles.set(job.id, newHandles);
       }
     });
   }
