@@ -140,7 +140,7 @@ interface Job {
 
 interface WorkerInfo {
   clientHandle: any; // WS client handle from server-level event
-  capabilities: string[];
+  capStr: string; // comma-separated capabilities (avoids perry array bugs)
   name: string;
   busy: boolean;
   current_job_id: string | null;
@@ -164,6 +164,15 @@ const jobQueue: string[] = []; // job IDs in priority order
 const workerList: WorkerInfo[] = [];
 const counters = { workers: 0, queueLen: 0 };
 const artifacts = new Map<string, ArtifactEntry>();
+// Use Maps for worker property lookup (perry workaround: reading properties from
+// objects stored in module-level arrays is unreliable)
+const workerCapMap = new Map<string, string>(); // "w0" -> ",macos,ios,android,"
+const workerNameMap = new Map<string, string>(); // "w0" -> "macbook-intel"
+const workerHandleMap = new Map<string, number>(); // "w0" -> clientHandle
+const workerBusyMap = new Map<string, boolean>(); // "w0" -> false
+const workerJobMap = new Map<string, string>(); // "w0" -> current_job_id or ""
+// Precomputed JSON string of supported targets (rebuilt on worker connect/disconnect)
+const cached = { targetsJson: '[]' };
 
 // Map job_id -> CLI client handle (stored as string to avoid NaN issues with arrays)
 const jobCliHandles = new Map<string, string>(); // job_id -> "handle1,handle2,..."
@@ -399,56 +408,137 @@ function dequeueJob(): Job | null {
 
 // --- Worker pool ---
 
-function getAvailableWorker(requiredCapabilities: string[]): WorkerInfo | null {
+function getWorkerCapStr(wi: number): string {
+  return workerCapMap.get('w' + String(wi)) || ',';
+}
+
+function rebuildTargetsJson(): void {
+  // Check each known target against all worker capStr entries
+  // Avoid split/length comparisons entirely (broken in perry)
+  const known = [',macos,', ',ios,', ',android,', ',linux,', ',windows,'];
+  const labels = ['"macos"', '"ios"', '"android"', '"linux"', '"windows"'];
+  let json = '[';
+  let first = true;
+  for (let ki = 0; ki < 5; ki++) {
+    let found = false;
+    for (let wi = 0; wi < counters.workers; wi++) {
+      const cs = workerCapMap.get('w' + String(wi)) || ',';
+      if (cs.indexOf(known[ki]) >= 0) {
+        found = true;
+        break;
+      }
+    }
+    if (found) {
+      if (!first) json = json + ',';
+      json = json + labels[ki];
+      first = false;
+    }
+  }
+  json = json + ']';
+  cached.targetsJson = json;
+  console.log('rebuildTargetsJson: ' + json);
+}
+
+function workerIdxHasCapability(wi: number, cap: string): boolean {
+  const cs = getWorkerCapStr(wi);
+  const needle = ',' + cap + ',';
+  const idx = cs.indexOf(needle);
+  // Perry bug: < 0 comparison is unreliable with indexOf results.
+  // Use >= 0 (positive check) which works correctly in rebuildTargetsJson.
+  if (idx >= 0) return true;
+  return false;
+}
+
+// Returns worker INDEX (not the worker object, which has corrupted properties in perry)
+function getAvailableWorkerIdx(requiredCaps: string[], reqLen: number): number {
+  console.log('getAvailableWorkerIdx: checking ' + String(counters.workers) + ' workers for ' + String(reqLen) + ' caps');
   for (let wi = 0; wi < counters.workers; wi++) {
-    const worker = workerList[wi];
-    if (!worker.busy) {
-      const hasAll = requiredCapabilities.every(cap => worker.capabilities.includes(cap));
+    const wKey = 'w' + String(wi);
+    const wName = workerNameMap.get(wKey) || '?';
+    const wBusy = workerBusyMap.get(wKey) || false;
+    console.log('getAvailableWorkerIdx: ' + wKey + ' name=' + wName + ' busy=' + String(wBusy));
+    if (!wBusy) {
+      let hasAll = true;
+      for (let ri = 0; ri < reqLen; ri++) {
+        const hasCap = workerIdxHasCapability(wi, requiredCaps[ri]);
+        console.log('getAvailableWorkerIdx: ' + wKey + ' cap=' + requiredCaps[ri] + ' has=' + String(hasCap));
+        if (!hasCap) {
+          hasAll = false;
+          break;
+        }
+      }
       if (hasAll) {
-        return worker;
+        console.log('getAvailableWorkerIdx: selected ' + wKey + ' name=' + wName);
+        return wi;
       }
     }
   }
-  return null;
+  return -1;
 }
 
 function getSupportedTargets(): string[] {
-  const targets = new Set<string>();
+  // Collect unique capabilities from all workers using string dedup
+  let allCaps = ',';
   for (let wi = 0; wi < counters.workers; wi++) {
-    const worker = workerList[wi];
-    const caps = worker.capabilities;
-    for (let ci = 0; ci < caps.length; ci++) {
-      targets.add(caps[ci]);
+    const cs = getWorkerCapStr(wi);
+    const parts = cs.split(',');
+    for (let pi = 0; pi < parts.length; pi++) {
+      const p = parts[pi];
+      if (p.length > 0 && allCaps.indexOf(',' + p + ',') < 0) {
+        allCaps = allCaps + p + ',';
+      }
     }
   }
-  return Array.from(targets);
+  // Convert to array for JSON
+  const result: string[] = [];
+  let rLen = 0;
+  const final = allCaps.split(',');
+  for (let fi = 0; fi < final.length; fi++) {
+    if (final[fi].length > 0) {
+      result[rLen] = final[fi];
+      rLen++;
+    }
+  }
+  return result;
 }
 
 function dispatchJob(job: Job): boolean {
   // Determine required capabilities from manifest targets
   const requiredCaps: string[] = [];
+  let reqCapLen = 0;
+  console.log('dispatchJob: manifest=' + JSON.stringify(job.manifest));
   if (job.manifest.targets) {
     const manifestTargets = job.manifest.targets;
     for (let ti = 0; ti < manifestTargets.length; ti++) {
-      requiredCaps.push(manifestTargets[ti].toLowerCase());
+      requiredCaps[reqCapLen] = manifestTargets[ti].toLowerCase();
+      reqCapLen++;
     }
   }
-  if (requiredCaps.length === 0) {
-    requiredCaps.push('macos'); // default
+  if (reqCapLen === 0) {
+    requiredCaps[0] = 'macos'; // default
+    reqCapLen = 1;
   }
+  console.log('dispatchJob: reqCapLen=' + String(reqCapLen) + ' caps=' + requiredCaps[0]);
 
-  const worker = getAvailableWorker(requiredCaps);
-  if (!worker) {
+  const wi = getAvailableWorkerIdx(requiredCaps, reqCapLen);
+  // Perry bug: < 0 unreliable, use === -1
+  if (wi === -1) {
+    console.log('dispatchJob: no available worker');
     return false;
   }
 
-  worker.busy = true;
-  worker.current_job_id = job.id;
+  const wKey = 'w' + String(wi);
+  const wName = workerNameMap.get(wKey) || '?';
+  const wHandle = workerHandleMap.get(wKey) || 0;
+  console.log('dispatchJob: dispatching to ' + wName + ' (handle=' + String(wHandle) + ')');
+
+  workerBusyMap.set(wKey, true);
+  workerJobMap.set(wKey, job.id);
   job.status = 'running';
-  dbBuildStarted(job.id, worker.name);
+  dbBuildStarted(job.id, wName);
 
   try {
-    sendToClient(worker.clientHandle, JSON.stringify({
+    sendToClient(wHandle, JSON.stringify({
       type: 'job_assign',
       job_id: job.id,
       manifest: job.manifest,
@@ -457,8 +547,8 @@ function dispatchJob(job: Job): boolean {
       artifact_upload_url: getPublicUrl() + '/api/v1/artifact/upload/' + job.id,
     }));
   } catch (e) {
-    worker.busy = false;
-    worker.current_job_id = null;
+    workerBusyMap.set(wKey, false);
+    workerJobMap.set(wKey, '');
     job.status = 'queued';
     return false;
   }
@@ -599,9 +689,7 @@ function getPublicUrl(): string {
 // GET /api/v1/status
 app.get('/api/v1/status', async (request: any, reply: any) => {
   reply.header('Content-Type', 'application/json');
-  const targets = getSupportedTargets();
-  const targetsJson = '[' + targets.map((t: string) => '"' + t + '"').join(',') + ']';
-  return '{"status":"ok","queue_length":' + String(counters.queueLen) + ',"perry_version":"0.1.0","supported_targets":' + targetsJson + ',"connected_workers":' + String(counters.workers) + '}';
+  return '{"status":"ok","queue_length":' + String(counters.queueLen) + ',"perry_version":"0.1.0","supported_targets":' + cached.targetsJson + ',"connected_workers":' + String(counters.workers) + '}';
 });
 
 // POST /api/v1/license/register
@@ -857,17 +945,36 @@ wss.on('message', (clientHandle: any, data: any) => {
 
     if (msg.type === 'worker_hello') {
       setClientRole(clientHandle, 'worker');
+      // Build comma-delimited capStr from msg.capabilities array
+      // Format: ",macos,ios,android," for reliable indexOf matching
+      let capStr = ',';
+      const rawCaps = msg.capabilities;
+      if (rawCaps) {
+        for (let ci = 0; ci < rawCaps.length; ci++) {
+          capStr = capStr + rawCaps[ci] + ',';
+        }
+      } else {
+        capStr = ',macos,';
+      }
+      const workerName = msg.name || 'worker-' + String(counters.workers + 1);
+      const wKey = 'w' + String(counters.workers);
       const workerInfo: WorkerInfo = {
         clientHandle,
-        capabilities: msg.capabilities || ['macos'],
-        name: msg.name || 'worker-' + String(counters.workers + 1),
+        capStr: capStr,
+        name: workerName,
         busy: false,
         current_job_id: null,
       };
-      workerList[counters.workers] = workerInfo;  // avoid push() — corrupts values in perry
+      workerList[counters.workers] = workerInfo;  // keep for backwards compat
+      workerCapMap.set(wKey, capStr);
+      workerNameMap.set(wKey, workerName);
+      workerHandleMap.set(wKey, clientHandle);
+      workerBusyMap.set(wKey, false);
+      workerJobMap.set(wKey, '');
       setClientWorkerIdx(clientHandle, counters.workers);
       counters.workers++;
-      console.log('Worker connected: ' + workerInfo.name);
+      rebuildTargetsJson();
+      console.log('Worker connected: ' + workerName + ' caps=' + capStr);
       tryDispatchNext();
       return;
     }
@@ -905,7 +1012,7 @@ wss.on('message', (clientHandle: any, data: any) => {
   if (role === 'worker') {
     const wIdx = getClientWorkerIdx(clientHandle);
     if (wIdx >= 0 && wIdx < counters.workers) {
-      handleWorkerMessage(msg, workerList[wIdx]);
+      handleWorkerMessageByIdx(msg, wIdx);
     }
   } else if (role === 'cli') {
     handleCliMessage(msg, clientHandle);
@@ -923,11 +1030,14 @@ wss.on('close', (clientHandle: any) => {
   if (role === 'worker') {
     const wIdx = getClientWorkerIdx(clientHandle);
     if (wIdx >= 0 && wIdx < counters.workers) {
-      const workerInfo = workerList[wIdx];
-      console.log('Worker disconnected: ' + workerInfo.name);
+      const wKey = 'w' + String(wIdx);
+      const wName = workerNameMap.get(wKey) || '?';
+      const wBusy = workerBusyMap.get(wKey) || false;
+      const wJobId = workerJobMap.get(wKey) || '';
+      console.log('Worker disconnected: ' + wName);
 
-      if (workerInfo.busy && workerInfo.current_job_id) {
-        const job = jobs.get(workerInfo.current_job_id);
+      if (wBusy && wJobId) {
+        const job = jobs.get(wJobId);
         if (job && job.status === 'running') {
           job.status = 'failed';
           releaseRateLimit(job.license_key);
@@ -942,9 +1052,24 @@ wss.on('close', (clientHandle: any) => {
       // Remove worker from list — avoid splice() in perry, shift down manually
       counters.workers--;
       for (let wi = wIdx; wi < counters.workers; wi++) {
+        const nextKey = 'w' + String(wi + 1);
+        const curKey = 'w' + String(wi);
         workerList[wi] = workerList[wi + 1];
-        setClientWorkerIdx(workerList[wi].clientHandle, wi);
+        workerCapMap.set(curKey, workerCapMap.get(nextKey) || ',');
+        workerNameMap.set(curKey, workerNameMap.get(nextKey) || '?');
+        const nextHandle = workerHandleMap.get(nextKey) || 0;
+        workerHandleMap.set(curKey, nextHandle);
+        workerBusyMap.set(curKey, workerBusyMap.get(nextKey) || false);
+        workerJobMap.set(curKey, workerJobMap.get(nextKey) || '');
+        setClientWorkerIdx(nextHandle, wi);
       }
+      const lastKey = 'w' + String(counters.workers);
+      workerCapMap.delete(lastKey);
+      workerNameMap.delete(lastKey);
+      workerHandleMap.delete(lastKey);
+      workerBusyMap.delete(lastKey);
+      workerJobMap.delete(lastKey);
+      rebuildTargetsJson();
     }
   }
 
@@ -979,9 +1104,10 @@ wss.on('error', (err: any) => {
   console.error('WebSocket server error:', err);
 });
 
-function handleWorkerMessage(msg: any, worker: WorkerInfo): void {
+function handleWorkerMessageByIdx(msg: any, wIdx: number): void {
+  const wKey = 'w' + String(wIdx);
   const msgType = msg.type;
-  const jobId = msg.job_id || worker.current_job_id;
+  const jobId = msg.job_id || workerJobMap.get(wKey) || '';
 
   if (msgType === 'progress' || msgType === 'stage' || msgType === 'log' || msgType === 'queue_update' || msgType === 'published') {
     if (jobId) {
@@ -1023,8 +1149,8 @@ function handleWorkerMessage(msg: any, worker: WorkerInfo): void {
     const completeJson = JSON.stringify(msg);
     relayToCliClientsJson(jobId, completeJson);
 
-    worker.busy = false;
-    worker.current_job_id = null;
+    workerBusyMap.set(wKey, false);
+    workerJobMap.set(wKey, '');
 
     tryDispatchNext();
   } else if (msgType === 'error') {
@@ -1040,10 +1166,12 @@ function handleCliMessage(msg: any, clientHandle: any): void {
     if (job && job.status === 'running') {
       // Find the worker handling this job and send cancel
       for (let wi = 0; wi < counters.workers; wi++) {
-        const worker = workerList[wi];
-        if (worker.current_job_id === msg.job_id) {
+        const wKey = 'w' + String(wi);
+        const wJobId = workerJobMap.get(wKey) || '';
+        if (wJobId === msg.job_id) {
           try {
-            sendToClient(worker.clientHandle, JSON.stringify({ type: 'cancel', job_id: msg.job_id }));
+            const wHandle = workerHandleMap.get(wKey) || 0;
+            sendToClient(wHandle, JSON.stringify({ type: 'cancel', job_id: msg.job_id }));
           } catch (e) {
             // Worker may have disconnected
           }
