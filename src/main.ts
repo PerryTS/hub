@@ -760,8 +760,8 @@ app.post('/api/v1/build', async (request: any, reply: any) => {
     return JSON.stringify({ error: { code: 'BAD_REQUEST', message: 'Expected multipart/form-data' } });
   }
 
-  // Parse multipart body (request.text = raw body string from perry runtime)
-  const rawBody = request.text;
+  // Parse multipart body (request.rawBody = raw body string from perry runtime)
+  const rawBody = request.rawBody;
   let parts: MultipartPart[];
   try {
     parts = parseMultipart(rawBody, contentType);
@@ -937,7 +937,7 @@ app.post('/api/v1/artifact/upload/:jobId', async (request: any, reply: any) => {
     return JSON.stringify({ error: { code: 'JOB_NOT_RUNNING', message: 'Job is not in running state' } });
   }
 
-  const rawBody = request.text || request.body || '';
+  const rawBody = request.rawBody;
   if (!rawBody || typeof rawBody !== 'string') {
     reply.status(400);
     return JSON.stringify({ error: { code: 'BAD_REQUEST', message: 'Missing base64 artifact data in body' } });
