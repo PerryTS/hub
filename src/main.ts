@@ -87,6 +87,8 @@ function parseMultipart(body: string, contentType: string): MultipartPart[] {
 const HTTP_PORT = parseInt(process.env.PERRY_HUB_HTTP_PORT || '3456', 10);
 const WS_PORT = parseInt(process.env.PERRY_HUB_WS_PORT || '3457', 10);
 const ARTIFACT_TTL_SECS = parseInt(process.env.PERRY_HUB_ARTIFACT_TTL_SECS || '600', 10);
+const WORKER_SECRET = process.env.PERRY_HUB_WORKER_SECRET || '';
+const ADMIN_SECRET = process.env.PERRY_HUB_ADMIN_SECRET || '';
 
 function isSelfHosted(): boolean {
   const v = process.env.PERRY_HUB_SELF_HOSTED || '';
@@ -103,11 +105,11 @@ const ARTIFACT_DIR = '/tmp/perry-artifacts';
 
 function createDbPool(): Pool {
   return mysql.createPool({
-    host: 'localhost',
-    port: 3306,
-    user: 'perry',
-    password: 'perry',
-    database: 'perry_hub',
+    host: process.env.PERRY_DB_HOST || 'localhost',
+    port: parseInt(process.env.PERRY_DB_PORT || '3306', 10),
+    user: process.env.PERRY_DB_USER || 'perry',
+    password: process.env.PERRY_DB_PASSWORD || '',
+    database: process.env.PERRY_DB_NAME || 'perry_hub',
   });
 }
 
@@ -136,7 +138,10 @@ interface Job {
   status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
   created_at: number;
   priority: number;
+  retries: number;
 }
+
+const MAX_JOB_RETRIES = 3;
 
 interface WorkerInfo {
   clientHandle: any; // WS client handle from server-level event
@@ -164,6 +169,13 @@ const jobQueue: string[] = []; // job IDs in priority order
 const workerList: WorkerInfo[] = [];
 const counters = { workers: 0, queueLen: 0 };
 const artifacts = new Map<string, ArtifactEntry>();
+const jobTokens = new Map<string, string>(); // job_id -> bearer token for worker auth
+
+// Escape a string for safe interpolation into hand-built JSON
+function jsonEscape(s: string): string {
+  return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r/g, '\\r').replace(/\n/g, '\\n');
+}
+
 // Use Maps for worker property lookup (perry workaround: reading properties from
 // objects stored in module-level arrays is unreliable)
 const workerCapMap = new Map<string, string>(); // "w0" -> ",macos,ios,android,"
@@ -537,16 +549,21 @@ function dispatchJob(job: Job): boolean {
   job.status = 'running';
   dbBuildStarted(job.id, wName);
 
+  const jobToken = crypto.randomUUID();
+  jobTokens.set(job.id, jobToken);
+
   try {
     sendToClient(wHandle, JSON.stringify({
       type: 'job_assign',
       job_id: job.id,
+      auth_token: jobToken,
       manifest: job.manifest,
       credentials: job.credentials,
       tarball_url: getPublicUrl() + '/api/v1/tarball/' + job.id,
       artifact_upload_url: getPublicUrl() + '/api/v1/artifact/upload/' + job.id,
     }));
   } catch (e) {
+    jobTokens.delete(job.id);
     workerBusyMap.set(wKey, false);
     workerJobMap.set(wKey, '');
     job.status = 'queued';
@@ -695,6 +712,15 @@ app.get('/api/v1/status', async (request: any, reply: any) => {
 // POST /api/v1/license/register
 app.post('/api/v1/license/register', async (request: any, reply: any) => {
   reply.header('Content-Type', 'application/json');
+
+  if (ADMIN_SECRET) {
+    const auth = request.headers['authorization'] || '';
+    if (auth !== 'Bearer ' + ADMIN_SECRET) {
+      reply.status(403);
+      return JSON.stringify({ error: { code: 'FORBIDDEN', message: 'Admin authentication required' } });
+    }
+  }
+
   let body: any = request.body || {};
 
   const username = body.github_username || '';
@@ -772,11 +798,22 @@ app.post('/api/v1/build', async (request: any, reply: any) => {
   }
 
   const licenseKey = licensePart.data;
-  const manifest = JSON.parse(manifestPart.data);
+  let manifest: any;
+  try {
+    manifest = JSON.parse(manifestPart.data);
+  } catch (e: any) {
+    reply.status(400);
+    return JSON.stringify({ error: { code: 'BAD_REQUEST', message: 'Invalid manifest JSON' } });
+  }
 
   let credentials: any = {};
   if (credentialsPart) {
-    credentials = JSON.parse(credentialsPart.data);
+    try {
+      credentials = JSON.parse(credentialsPart.data);
+    } catch (e: any) {
+      reply.status(400);
+      return JSON.stringify({ error: { code: 'BAD_REQUEST', message: 'Invalid credentials JSON' } });
+    }
   }
 
   // Validate license
@@ -810,6 +847,7 @@ app.post('/api/v1/build', async (request: any, reply: any) => {
     status: 'queued',
     created_at: Date.now(),
     priority: license.tier === 'pro' ? 10 : 1,
+    retries: 0,
   };
 
   const position = enqueueJob(job);
@@ -839,7 +877,8 @@ app.get('/api/v1/dl/:token', async (request: any, reply: any) => {
   try {
     const data = fs.readFileSync(entry.path);
     reply.header('Content-Type', 'application/octet-stream');
-    reply.header('Content-Disposition', `attachment; filename="${entry.name}"`);
+    const safeName = entry.name.replace(/[^a-zA-Z0-9._-]/g, '_');
+    reply.header('Content-Disposition', `attachment; filename="${safeName}"`);
     reply.header('Content-Length', String(entry.size));
     return data;
   } catch (e: any) {
@@ -852,6 +891,13 @@ app.get('/api/v1/dl/:token', async (request: any, reply: any) => {
 // GET /api/v1/tarball/:jobId — workers download the base64-encoded tarball for a job
 app.get('/api/v1/tarball/:jobId', async (request: any, reply: any) => {
   const jobId = request.params.jobId;
+  const expectedToken = jobTokens.get(jobId) || '';
+  const auth = request.headers['authorization'] || '';
+  if (!expectedToken || auth !== 'Bearer ' + expectedToken) {
+    reply.status(403);
+    reply.header('Content-Type', 'application/json');
+    return JSON.stringify({ error: { code: 'FORBIDDEN', message: 'Invalid job token' } });
+  }
   const b64Path = TARBALL_DIR + '/' + jobId + '.b64';
   try {
     const b64Data = fs.readFileSync(b64Path);
@@ -870,6 +916,12 @@ app.get('/api/v1/tarball/:jobId', async (request: any, reply: any) => {
 app.post('/api/v1/artifact/upload/:jobId', async (request: any, reply: any) => {
   reply.header('Content-Type', 'application/json');
   const jobId = request.params.jobId;
+  const expectedToken = jobTokens.get(jobId) || '';
+  const authHdr = request.headers['authorization'] || '';
+  if (!expectedToken || authHdr !== 'Bearer ' + expectedToken) {
+    reply.status(403);
+    return JSON.stringify({ error: { code: 'FORBIDDEN', message: 'Invalid job token' } });
+  }
   const hdrs = request.headers;
   const artifactName = hdrs['x-artifact-name'] || 'artifact';
   const sha256 = hdrs['x-artifact-sha256'] || '';
@@ -905,13 +957,22 @@ app.post('/api/v1/artifact/upload/:jobId', async (request: any, reply: any) => {
   const downloadUrl = getPublicUrl() + '/api/v1/dl/' + token;
 
   // Notify CLI clients watching this job
-  const artJson = '{"type":"artifact_ready","job_id":"' + jobId + '","target":"' + target + '","artifact_name":"' + artifactName + '","artifact_size":' + String(size) + ',"sha256":"' + sha256 + '","download_url":"' + downloadUrl + '","expires_in_secs":' + String(ARTIFACT_TTL_SECS) + '}';
+  const artJson = '{"type":"artifact_ready","job_id":"' + jsonEscape(jobId) + '","target":"' + jsonEscape(target) + '","artifact_name":"' + jsonEscape(artifactName) + '","artifact_size":' + String(size) + ',"sha256":"' + jsonEscape(sha256) + '","download_url":"' + jsonEscape(downloadUrl) + '","expires_in_secs":' + String(ARTIFACT_TTL_SECS) + '}';
   relayToCliClientsJson(jobId, artJson);
 
   console.log('Artifact uploaded for job ' + jobId + ': ' + artifactName + ' (' + String(size) + ' bytes)');
 
   return JSON.stringify({ token: token, download_url: downloadUrl, size: size });
 });
+
+// --- Worker secret check ---
+// Extracted as a top-level function because calling sendToClient/closeClient
+// inside nested conditionals within wss.on('message') triggers a perry
+// codegen bug that prevents the WebSocket server from binding its port.
+function rejectWorkerAuth(handle: any): void {
+  sendToClient(handle, JSON.stringify({ type: 'error', code: 'AUTH_FAILED', message: 'Invalid worker secret' }));
+  closeClient(handle);
+}
 
 // --- WebSocket server ---
 // Uses server-level events (wss.on) instead of per-connection ws.on()
@@ -944,6 +1005,10 @@ wss.on('message', (clientHandle: any, data: any) => {
     setClientIdentified(clientHandle);
 
     if (msg.type === 'worker_hello') {
+      if (WORKER_SECRET && msg.secret !== WORKER_SECRET) {
+        rejectWorkerAuth(clientHandle);
+        return;
+      }
       setClientRole(clientHandle, 'worker');
       // Build comma-delimited capStr from msg.capabilities array
       // Format: ",macos,ios,android," for reliable indexOf matching
@@ -1039,13 +1104,28 @@ wss.on('close', (clientHandle: any) => {
       if (wBusy && wJobId) {
         const job = jobs.get(wJobId);
         if (job && job.status === 'running') {
-          job.status = 'failed';
-          releaseRateLimit(job.license_key);
-          const errJson = '{"type":"error","code":"INTERNAL_ERROR","message":"Worker disconnected during build"}';
-          relayToCliClientsJson(job.id, errJson);
-          const dur = (Date.now() - job.created_at) / 1000;
-          const completeJson = '{"type":"complete","job_id":"' + job.id + '","success":false,"duration_secs":' + String(dur) + ',"artifacts":[]}';
-          relayToCliClientsJson(job.id, completeJson);
+          jobTokens.delete(wJobId);
+          const retries = job.retries || 0;
+          if (retries < MAX_JOB_RETRIES) {
+            // Re-queue — another worker can pick it up
+            job.status = 'queued';
+            job.retries = retries + 1;
+            jobQueue.unshift(job.id);
+            counters.queueLen++;
+            console.log('Re-queued job ' + job.id + ' (worker ' + wName + ' disconnected, retry ' + String(job.retries) + '/' + String(MAX_JOB_RETRIES) + ')');
+            const requeueJson = '{"type":"queue_update","job_id":"' + job.id + '","position":1,"message":"Builder disconnected, re-queued (attempt ' + String(job.retries + 1) + ')"}';
+            relayToCliClientsJson(job.id, requeueJson);
+          } else {
+            // Exhausted retries — fail permanently
+            job.status = 'failed';
+            releaseRateLimit(job.license_key);
+            console.log('Job ' + job.id + ' failed after ' + String(MAX_JOB_RETRIES) + ' retries');
+            const errJson = '{"type":"error","code":"INTERNAL_ERROR","message":"Build failed after ' + String(MAX_JOB_RETRIES) + ' attempts (workers kept disconnecting)"}';
+            relayToCliClientsJson(job.id, errJson);
+            const dur = (Date.now() - job.created_at) / 1000;
+            const completeJson = '{"type":"complete","job_id":"' + job.id + '","success":false,"duration_secs":' + String(dur) + ',"artifacts":[]}';
+            relayToCliClientsJson(job.id, completeJson);
+          }
         }
       }
 
@@ -1070,6 +1150,7 @@ wss.on('close', (clientHandle: any) => {
       workerBusyMap.delete(lastKey);
       workerJobMap.delete(lastKey);
       rebuildTargetsJson();
+      tryDispatchNext();
     }
   }
 
@@ -1118,8 +1199,15 @@ function handleWorkerMessageByIdx(msg: any, wIdx: number): void {
     const job = jobs.get(jobId);
     if (!job) return;
 
+    // Validate path is within ARTIFACT_DIR to prevent path traversal
+    const artPath = String(msg.path || '');
+    if (!artPath.startsWith(ARTIFACT_DIR + '/')) {
+      console.error('artifact_ready: rejected path traversal attempt: ' + artPath);
+      return;
+    }
+
     const token = registerArtifact(
-      msg.path,
+      artPath,
       msg.artifact_name,
       msg.sha256,
       msg.size,
@@ -1127,7 +1215,7 @@ function handleWorkerMessageByIdx(msg: any, wIdx: number): void {
     const downloadUrl = getPublicUrl() + '/api/v1/dl/' + token;
     const target = msg.target || '';
 
-    const artJson = '{"type":"artifact_ready","job_id":"' + jobId + '","target":"' + target + '","artifact_name":"' + msg.artifact_name + '","artifact_size":' + String(msg.size) + ',"sha256":"' + msg.sha256 + '","download_url":"' + downloadUrl + '","expires_in_secs":' + String(ARTIFACT_TTL_SECS) + '}';
+    const artJson = '{"type":"artifact_ready","job_id":"' + jsonEscape(jobId) + '","target":"' + jsonEscape(target) + '","artifact_name":"' + jsonEscape(msg.artifact_name) + '","artifact_size":' + String(msg.size) + ',"sha256":"' + jsonEscape(msg.sha256) + '","download_url":"' + jsonEscape(downloadUrl) + '","expires_in_secs":' + String(ARTIFACT_TTL_SECS) + '}';
     relayToCliClientsJson(jobId, artJson);
   } else if (msgType === 'complete') {
     if (!jobId) return;
@@ -1142,7 +1230,8 @@ function handleWorkerMessageByIdx(msg: any, wIdx: number): void {
       releaseRateLimit(job.license_key);
       const durationSecs = Math.round((Date.now() - job.created_at) / 1000);
       dbBuildFinished(jobId, msg.success, durationSecs, msg.error || '');
-      // Clean up tarball b64 file now that the worker is done with it
+      // Clean up tarball and job token now that the worker is done
+      jobTokens.delete(jobId);
       try { fs.unlinkSync(TARBALL_DIR + '/' + jobId + '.b64'); } catch (e) { /* ignore */ }
     }
 
