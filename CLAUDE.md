@@ -42,11 +42,21 @@ limitations that heavily influence code style:
 See memory file `perry-quirks.md` for the full list.
 
 ## Key Subsystems
-- **Licenses**: in-memory Map, persisted to `/tmp/perry-hub-data/licenses.json`
+- **Licenses**: MySQL-backed, cached in-memory Map
 - **Job queue**: priority-ordered (pro tier > free tier)
 - **Worker pool**: workers connect via WS, identified by platform capabilities
 - **Artifacts**: temp files in `/tmp/perry-artifacts/`, auto-cleaned after TTL
 - **Rate limiting**: per-license concurrent + hourly limits
+
+## Environment Variables
+- `PERRY_HUB_HTTP_PORT` — HTTP port (default: 3456)
+- `PERRY_HUB_WS_PORT` — WebSocket port (default: 3457)
+- `PERRY_HUB_WORKER_SECRET` — shared secret for worker authentication
+- `PERRY_HUB_ADMIN_SECRET` — secret for admin endpoints (license registration)
+- `PERRY_HUB_PUBLIC_URL` — public-facing URL for download links
+- `PERRY_HUB_SELF_HOSTED` — set to `true` to disable rate limiting
+- `PERRY_HUB_ARTIFACT_TTL_SECS` — artifact expiry (default: 600)
+- `PERRY_DB_HOST`, `PERRY_DB_PORT`, `PERRY_DB_USER`, `PERRY_DB_PASSWORD`, `PERRY_DB_NAME` — MySQL connection
 
 ## Related Repos
 - [perry](https://github.com/PerryTS/perry) — compiler + CLI
