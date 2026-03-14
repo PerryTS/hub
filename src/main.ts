@@ -4,6 +4,7 @@
 import Fastify from 'fastify';
 import * as fs from 'fs';
 import * as crypto from 'crypto';
+import * as child_process from 'child_process';
 import { WebSocketServer, sendToClient, closeClient } from 'ws';
 import mysql from 'mysql2/promise';
 
@@ -96,6 +97,19 @@ function isSelfHosted(): boolean {
 }
 const TARBALL_DIR = '/tmp/perry-hub-tarballs';
 const ARTIFACT_DIR = '/tmp/perry-artifacts';
+const VERIFY_URL = process.env.PERRY_VERIFY_URL || 'http://localhost:7777';
+const VERIFY_POLL_INTERVAL_MS = 5000;
+const VERIFY_TIMEOUT_MS = 120000; // 2 minutes max
+
+// --- Verification state ---
+// Track pending verifications: buildJobId → verifyJobId
+const verifyJobIdMap = new Map<string, string>();
+// Track which worker index is waiting for verification
+const verifyWorkerIdxMap = new Map<string, number>();
+// Track artifact path for verification
+const verifyArtifactPathMap = new Map<string, string>();
+// Track verification start time for timeout
+const verifyStartTimeMap = new Map<string, number>();
 
 // --- Database pool ---
 // createPool must be called inside a function (not inline at module level)
@@ -183,8 +197,11 @@ const workerNameMap = new Map<string, string>(); // "w0" -> "macbook-intel"
 const workerHandleMap = new Map<string, number>(); // "w0" -> clientHandle
 const workerBusyMap = new Map<string, boolean>(); // "w0" -> false
 const workerJobMap = new Map<string, string>(); // "w0" -> current_job_id or ""
+const workerVersionMap = new Map<string, string>(); // "w0" -> "0.2.181"
 // Precomputed JSON string of supported targets (rebuilt on worker connect/disconnect)
 const cached = { targetsJson: '[]' };
+// Expected perry version — set via admin endpoint or env
+const perryExpected = { version: process.env.PERRY_EXPECTED_VERSION || '' };
 
 // Map job_id -> CLI client handle (stored as string to avoid NaN issues with arrays)
 const jobCliHandles = new Map<string, string>(); // job_id -> "handle1,handle2,..."
@@ -706,7 +723,59 @@ function getPublicUrl(): string {
 // GET /api/v1/status
 app.get('/api/v1/status', async (request: any, reply: any) => {
   reply.header('Content-Type', 'application/json');
-  return '{"status":"ok","queue_length":' + String(counters.queueLen) + ',"perry_version":"0.1.0","supported_targets":' + cached.targetsJson + ',"connected_workers":' + String(counters.workers) + '}';
+  return '{"status":"ok","queue_length":' + String(counters.queueLen) + ',"perry_version":"0.1.0","expected_perry_version":"' + jsonEscape(perryExpected.version) + '","supported_targets":' + cached.targetsJson + ',"connected_workers":' + String(counters.workers) + '}';
+});
+
+// POST /api/v1/admin/update-perry — trigger perry compiler update on all workers
+app.post('/api/v1/admin/update-perry', async (request: any, reply: any) => {
+  reply.header('Content-Type', 'application/json');
+
+  if (ADMIN_SECRET) {
+    const auth = request.headers['authorization'] || '';
+    if (auth !== 'Bearer ' + ADMIN_SECRET) {
+      reply.status(403);
+      return JSON.stringify({ error: { code: 'FORBIDDEN', message: 'Admin authentication required' } });
+    }
+  }
+
+  let body: any = request.body || {};
+  // Optionally set the expected version so future workers auto-update
+  if (body.expected_version) {
+    perryExpected.version = body.expected_version;
+    console.log('Updated expected perry version to ' + perryExpected.version);
+  }
+
+  let sent = 0;
+  for (let wi = 0; wi < counters.workers; wi++) {
+    const wKey = 'w' + String(wi);
+    const wHandle = workerHandleMap.get(wKey) || 0;
+    const wName = workerNameMap.get(wKey) || '?';
+    const wBusy = workerBusyMap.get(wKey) || false;
+    if (wBusy) {
+      console.log('Skipping busy worker ' + wName + ' for perry update');
+      continue;
+    }
+    try {
+      sendToClient(wHandle, '{"type":"update_perry"}');
+      console.log('Sent update_perry to worker ' + wName);
+      sent++;
+    } catch (e) {
+      console.error('Failed to send update_perry to ' + wName + ': ' + String(e));
+    }
+  }
+
+  // Build worker info for response
+  let workersJson = '[';
+  for (let wi = 0; wi < counters.workers; wi++) {
+    const wKey = 'w' + String(wi);
+    if (wi > 0) workersJson = workersJson + ',';
+    workersJson = workersJson + '{"name":"' + jsonEscape(workerNameMap.get(wKey) || '?')
+      + '","perry_version":"' + jsonEscape(workerVersionMap.get(wKey) || 'unknown')
+      + '","busy":' + String(workerBusyMap.get(wKey) || false) + '}';
+  }
+  workersJson = workersJson + ']';
+
+  return '{"ok":true,"workers_notified":' + String(sent) + ',"expected_version":"' + jsonEscape(perryExpected.version) + '","workers":' + workersJson + '}';
 });
 
 // POST /api/v1/license/register
@@ -950,6 +1019,8 @@ app.post('/api/v1/artifact/upload/:jobId', async (request: any, reply: any) => {
   const artifactPath = ARTIFACT_DIR + '/' + artifactId;
   const buffer = Buffer.from(b64Data, 'base64');
   fs.writeFileSync(artifactPath, buffer);
+  // Save base64 for verification submission
+  fs.writeFileSync(artifactPath + '.b64', b64Data);
   const size = buffer.length;
 
   // Register artifact with download token
@@ -959,6 +1030,9 @@ app.post('/api/v1/artifact/upload/:jobId', async (request: any, reply: any) => {
   // Notify CLI clients watching this job
   const artJson = '{"type":"artifact_ready","job_id":"' + jsonEscape(jobId) + '","target":"' + jsonEscape(target) + '","artifact_name":"' + jsonEscape(artifactName) + '","artifact_size":' + String(size) + ',"sha256":"' + jsonEscape(sha256) + '","download_url":"' + jsonEscape(downloadUrl) + '","expires_in_secs":' + String(ARTIFACT_TTL_SECS) + '}';
   relayToCliClientsJson(jobId, artJson);
+
+  // Track artifact path for verification
+  verifyArtifactPathMap.set(jobId, artifactPath);
 
   console.log('Artifact uploaded for job ' + jobId + ': ' + artifactName + ' (' + String(size) + ' bytes)');
 
@@ -1036,10 +1110,23 @@ wss.on('message', (clientHandle: any, data: any) => {
       workerHandleMap.set(wKey, clientHandle);
       workerBusyMap.set(wKey, false);
       workerJobMap.set(wKey, '');
+      const workerVersion = msg.perry_version || '';
+      workerVersionMap.set(wKey, workerVersion);
       setClientWorkerIdx(clientHandle, counters.workers);
       counters.workers++;
       rebuildTargetsJson();
-      console.log('Worker connected: ' + workerName + ' caps=' + capStr);
+      console.log('Worker connected: ' + workerName + ' caps=' + capStr + ' perry=' + workerVersion);
+
+      // Auto-update if worker is behind expected version
+      if (perryExpected.version && workerVersion && workerVersion !== perryExpected.version) {
+        console.log('Worker ' + workerName + ' has perry ' + workerVersion + ', expected ' + perryExpected.version + ' — sending update_perry');
+        try {
+          sendToClient(clientHandle, '{"type":"update_perry"}');
+        } catch (e) {
+          // ignore send failure
+        }
+      }
+
       tryDispatchNext();
       return;
     }
@@ -1141,6 +1228,7 @@ wss.on('close', (clientHandle: any) => {
         workerHandleMap.set(curKey, nextHandle);
         workerBusyMap.set(curKey, workerBusyMap.get(nextKey) || false);
         workerJobMap.set(curKey, workerJobMap.get(nextKey) || '');
+        workerVersionMap.set(curKey, workerVersionMap.get(nextKey) || '');
         setClientWorkerIdx(nextHandle, wi);
       }
       const lastKey = 'w' + String(counters.workers);
@@ -1149,6 +1237,7 @@ wss.on('close', (clientHandle: any) => {
       workerHandleMap.delete(lastKey);
       workerBusyMap.delete(lastKey);
       workerJobMap.delete(lastKey);
+      workerVersionMap.delete(lastKey);
       rebuildTargetsJson();
       tryDispatchNext();
     }
@@ -1217,6 +1306,40 @@ function handleWorkerMessageByIdx(msg: any, wIdx: number): void {
 
     const artJson = '{"type":"artifact_ready","job_id":"' + jsonEscape(jobId) + '","target":"' + jsonEscape(target) + '","artifact_name":"' + jsonEscape(msg.artifact_name) + '","artifact_size":' + String(msg.size) + ',"sha256":"' + jsonEscape(msg.sha256) + '","download_url":"' + jsonEscape(downloadUrl) + '","expires_in_secs":' + String(ARTIFACT_TTL_SECS) + '}';
     relayToCliClientsJson(jobId, artJson);
+  } else if (msgType === 'build_complete') {
+    // Worker finished building but has a distribution step waiting for verification
+    if (!jobId) return;
+    const hasDistribution = msg.has_distribution === true;
+
+    if (hasDistribution) {
+      // Start verification before allowing distribution
+      verifyWorkerIdxMap.set(jobId, wIdx);
+      verifyStartTimeMap.set(jobId, Date.now());
+      console.log('Build complete for job ' + jobId + ', starting verification before distribution');
+
+      // Notify CLI that verification is starting
+      const verifyStageJson = '{"type":"stage","job_id":"' + jsonEscape(jobId) + '","stage":"verifying","message":"Verifying binary before distribution..."}';
+      relayToCliClientsJson(jobId, verifyStageJson);
+
+      // Submit to perry-verify
+      startVerification(jobId, wIdx);
+    } else {
+      // No distribution — treat as complete (shouldn't normally happen, but handle gracefully)
+      const job = jobs.get(jobId);
+      if (job) {
+        job.status = 'completed';
+        releaseRateLimit(job.license_key);
+        const durationSecs = Math.round((Date.now() - job.created_at) / 1000);
+        dbBuildFinished(jobId, true, durationSecs, '');
+        jobTokens.delete(jobId);
+        try { fs.unlinkSync(TARBALL_DIR + '/' + jobId + '.b64'); } catch (e) { /* ignore */ }
+      }
+      const completeJson = '{"type":"complete","job_id":"' + jsonEscape(jobId) + '","success":true,"duration_secs":' + String(msg.duration_secs || 0) + ',"artifacts":[]}';
+      relayToCliClientsJson(jobId, completeJson);
+      workerBusyMap.set(wKey, false);
+      workerJobMap.set(wKey, '');
+      tryDispatchNext();
+    }
   } else if (msgType === 'complete') {
     if (!jobId) return;
 
@@ -1235,6 +1358,12 @@ function handleWorkerMessageByIdx(msg: any, wIdx: number): void {
       try { fs.unlinkSync(TARBALL_DIR + '/' + jobId + '.b64'); } catch (e) { /* ignore */ }
     }
 
+    // Clean up verification state
+    verifyJobIdMap.delete(jobId);
+    verifyWorkerIdxMap.delete(jobId);
+    verifyArtifactPathMap.delete(jobId);
+    verifyStartTimeMap.delete(jobId);
+
     const completeJson = JSON.stringify(msg);
     relayToCliClientsJson(jobId, completeJson);
 
@@ -1242,6 +1371,14 @@ function handleWorkerMessageByIdx(msg: any, wIdx: number): void {
     workerJobMap.set(wKey, '');
 
     tryDispatchNext();
+  } else if (msgType === 'update_result') {
+    const wName = workerNameMap.get(wKey) || '?';
+    if (msg.success) {
+      workerVersionMap.set(wKey, msg.new_version || '');
+      console.log('Worker ' + wName + ' updated perry: ' + (msg.old_version || '?') + ' -> ' + (msg.new_version || '?'));
+    } else {
+      console.error('Worker ' + wName + ' perry update failed: ' + (msg.error || 'unknown error'));
+    }
   } else if (msgType === 'error') {
     if (jobId) {
       relayToCliClients(jobId, msg);
@@ -1269,6 +1406,180 @@ function handleCliMessage(msg: any, clientHandle: any): void {
       }
     }
   }
+}
+
+// --- Verification flow ---
+// Submit artifact to perry-verify and poll for results.
+// Uses execSync('curl ...') for localhost requests (fast, <100ms each).
+// Polling via setTimeout to avoid blocking the event loop continuously.
+
+function startVerification(buildJobId: string, wIdx: number): void {
+  const artifactPath = verifyArtifactPathMap.get(buildJobId) || '';
+  if (!artifactPath) {
+    console.error('No artifact path for verification of job ' + buildJobId);
+    sendVerifyResult(buildJobId, wIdx, false, 'No artifact available for verification');
+    return;
+  }
+
+  const b64Path = artifactPath + '.b64';
+  try {
+    fs.statSync(b64Path);
+  } catch (e) {
+    console.error('No .b64 file for verification of job ' + buildJobId);
+    sendVerifyResult(buildJobId, wIdx, false, 'No base64 artifact for verification');
+    return;
+  }
+
+  // Determine verify target from job manifest
+  const job = jobs.get(buildJobId);
+  let verifyTarget = 'macos-arm64';
+  if (job) {
+    const targets = job.manifest.targets || [];
+    for (let ti = 0; ti < targets.length; ti++) {
+      const t = targets[ti].toLowerCase();
+      if (t === 'ios') {
+        verifyTarget = 'ios-simulator';
+        break;
+      } else if (t === 'android') {
+        verifyTarget = 'android-emulator';
+        break;
+      } else if (t === 'macos') {
+        verifyTarget = 'macos-arm64';
+        break;
+      }
+    }
+  }
+
+  // Submit to perry-verify using curl (localhost, fast)
+  try {
+    const curlCmd = 'curl -s -X POST ' + VERIFY_URL + '/verify'
+      + ' -F "binary_b64=@' + b64Path + '"'
+      + ' -F "target=' + verifyTarget + '"'
+      + " -F 'config={\"auth\":{\"strategy\":\"none\"}}'"
+      + " -F 'manifest={\"appType\":\"gui\",\"hasAuthGate\":false,\"entryScreen\":\"main\"}'";
+    const result = child_process.execSync(curlCmd, { timeout: 30000 }).toString().trim();
+
+    // Parse verify job ID from response
+    // Response format: {"id":"<verifyJobId>","status":"queued",...}
+    let verifyId = '';
+    const idMatch = result.match(/"id"\s*:\s*"([^"]+)"/);
+    if (idMatch) {
+      verifyId = idMatch[1];
+    }
+
+    if (!verifyId) {
+      console.error('Failed to parse verify job ID from response: ' + result);
+      sendVerifyResult(buildJobId, wIdx, false, 'Failed to submit for verification');
+      return;
+    }
+
+    verifyJobIdMap.set(buildJobId, verifyId);
+    console.log('Verification submitted for job ' + buildJobId + ' -> verify job ' + verifyId);
+
+    // Clean up .b64 file now that it's been submitted
+    try { fs.unlinkSync(b64Path); } catch (e) { /* ignore */ }
+
+    // Start polling
+    setTimeout(function pollTick() { pollVerification(buildJobId); }, VERIFY_POLL_INTERVAL_MS);
+  } catch (e: any) {
+    console.error('Verification submission failed for job ' + buildJobId + ': ' + String(e));
+    // Clean up .b64 file
+    try { fs.unlinkSync(b64Path); } catch (e2) { /* ignore */ }
+    sendVerifyResult(buildJobId, wIdx, false, 'Verification service unavailable');
+  }
+}
+
+function pollVerification(buildJobId: string): void {
+  const verifyId = verifyJobIdMap.get(buildJobId) || '';
+  const wIdx = verifyWorkerIdxMap.get(buildJobId);
+  if (!verifyId || wIdx === undefined) return; // cleaned up, nothing to do
+
+  // Check timeout
+  const startTime = verifyStartTimeMap.get(buildJobId) || 0;
+  if (Date.now() - startTime > VERIFY_TIMEOUT_MS) {
+    console.error('Verification timed out for job ' + buildJobId);
+    sendVerifyResult(buildJobId, wIdx, false, 'Verification timed out');
+    return;
+  }
+
+  try {
+    const curlCmd = 'curl -s ' + VERIFY_URL + '/verify/' + verifyId;
+    const result = child_process.execSync(curlCmd, { timeout: 10000 }).toString().trim();
+
+    // Parse status from response
+    // Response format: {"id":"...","status":"completed","result":"passed",...}
+    let status = '';
+    let verifyResult = '';
+    const statusMatch = result.match(/"status"\s*:\s*"([^"]+)"/);
+    if (statusMatch) status = statusMatch[1];
+    const resultMatch = result.match(/"result"\s*:\s*"([^"]+)"/);
+    if (resultMatch) verifyResult = resultMatch[1];
+
+    if (status === 'completed' || status === 'failed') {
+      const passed = verifyResult === 'passed';
+      console.log('Verification ' + (passed ? 'passed' : 'failed') + ' for job ' + buildJobId);
+
+      // Forward verification progress to CLI
+      const pctJson = '{"type":"progress","job_id":"' + jsonEscape(buildJobId) + '","stage":"verifying","percent":100,"message":"Verification ' + (passed ? 'passed' : 'failed') + '"}';
+      relayToCliClientsJson(buildJobId, pctJson);
+
+      if (passed) {
+        sendVerifyResult(buildJobId, wIdx, true, '');
+      } else {
+        // Extract failure reason
+        let failReason = 'Verification failed';
+        const msgMatch = result.match(/"message"\s*:\s*"([^"]+)"/);
+        if (msgMatch) failReason = msgMatch[1];
+        sendVerifyResult(buildJobId, wIdx, false, failReason);
+      }
+    } else {
+      // Still running — forward progress and poll again
+      const pctJson = '{"type":"progress","job_id":"' + jsonEscape(buildJobId) + '","stage":"verifying","percent":50,"message":"Verifying binary..."}';
+      relayToCliClientsJson(buildJobId, pctJson);
+
+      setTimeout(function pollAgain() { pollVerification(buildJobId); }, VERIFY_POLL_INTERVAL_MS);
+    }
+  } catch (e: any) {
+    console.error('Verification poll failed for job ' + buildJobId + ': ' + String(e));
+    // Don't give up on transient errors — retry
+    setTimeout(function pollRetry() { pollVerification(buildJobId); }, VERIFY_POLL_INTERVAL_MS);
+  }
+}
+
+function sendVerifyResult(buildJobId: string, wIdx: number, passed: boolean, reason: string): void {
+  const wKey = 'w' + String(wIdx);
+  const wHandle = workerHandleMap.get(wKey);
+  if (!wHandle) {
+    console.error('Worker ' + wKey + ' not found for verify result');
+    return;
+  }
+
+  if (passed) {
+    const msg = '{"type":"proceed_distribute","job_id":"' + jsonEscape(buildJobId) + '"}';
+    try {
+      sendToClient(wHandle, msg);
+      console.log('Sent proceed_distribute to worker for job ' + buildJobId);
+    } catch (e) {
+      console.error('Failed to send proceed_distribute: ' + String(e));
+    }
+  } else {
+    const msg = '{"type":"skip_distribute","job_id":"' + jsonEscape(buildJobId) + '","reason":"' + jsonEscape(reason) + '"}';
+    try {
+      sendToClient(wHandle, msg);
+      console.log('Sent skip_distribute to worker for job ' + buildJobId + ': ' + reason);
+    } catch (e) {
+      console.error('Failed to send skip_distribute: ' + String(e));
+    }
+
+    // Notify CLI about verification failure
+    const errJson = '{"type":"error","job_id":"' + jsonEscape(buildJobId) + '","code":"VERIFY_FAILED","message":"' + jsonEscape(reason) + '"}';
+    relayToCliClientsJson(buildJobId, errJson);
+  }
+
+  // Clean up verification state
+  verifyJobIdMap.delete(buildJobId);
+  verifyWorkerIdxMap.delete(buildJobId);
+  verifyStartTimeMap.delete(buildJobId);
 }
 
 // --- Start servers ---
