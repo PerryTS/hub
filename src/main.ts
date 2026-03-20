@@ -1027,9 +1027,14 @@ app.post('/api/v1/artifact/upload/:jobId', async (request: any, reply: any) => {
   const token = registerArtifact(artifactPath, artifactName, sha256, size);
   const downloadUrl = getPublicUrl() + '/api/v1/dl/' + token;
 
-  // Notify CLI clients watching this job
-  const artJson = '{"type":"artifact_ready","job_id":"' + jsonEscape(jobId) + '","target":"' + jsonEscape(target) + '","artifact_name":"' + jsonEscape(artifactName) + '","artifact_size":' + String(size) + ',"sha256":"' + jsonEscape(sha256) + '","download_url":"' + jsonEscape(downloadUrl) + '","expires_in_secs":' + String(ARTIFACT_TTL_SECS) + '}';
-  relayToCliClientsJson(jobId, artJson);
+  // For windows-precompiled artifacts, don't notify CLI — this is an intermediate
+  // artifact that will be sent to the Windows sign-only worker for finishing.
+  if (target !== 'windows-precompiled') {
+    const artJson = '{"type":"artifact_ready","job_id":"' + jsonEscape(jobId) + '","target":"' + jsonEscape(target) + '","artifact_name":"' + jsonEscape(artifactName) + '","artifact_size":' + String(size) + ',"sha256":"' + jsonEscape(sha256) + '","download_url":"' + jsonEscape(downloadUrl) + '","expires_in_secs":' + String(ARTIFACT_TTL_SECS) + '}';
+    relayToCliClientsJson(jobId, artJson);
+  } else {
+    console.log('Intermediate windows-precompiled artifact for job ' + jobId + ' — holding for sign-only worker');
+  }
 
   // Track artifact path for verification
   verifyArtifactPathMap.set(jobId, artifactPath);
@@ -1344,6 +1349,63 @@ function handleWorkerMessageByIdx(msg: any, wIdx: number): void {
     if (!jobId) return;
 
     const job = jobs.get(jobId);
+
+    // Check if this job needs finishing by another worker (e.g. Linux cross-compiled
+    // a Windows exe and now the Windows sign-only worker needs to embed resources,
+    // sign, and package it).
+    if (msg.success && msg.needs_finishing && job && job.status === 'running') {
+      const finishTarget = msg.needs_finishing; // e.g. "windows"
+      console.log('Job ' + jobId + ' needs finishing by ' + finishTarget + ' worker');
+
+      // Free the current worker (Linux) so it can take new jobs
+      workerBusyMap.set(wKey, false);
+      workerJobMap.set(wKey, '');
+
+      // Replace the original tarball with the precompiled artifact bundle
+      // so the finishing worker downloads the precompiled bundle, not the source
+      const precompiledPath = verifyArtifactPathMap.get(jobId);
+      if (precompiledPath) {
+        const precompiledB64Path = precompiledPath + '.b64';
+        const tarballB64Path = TARBALL_DIR + '/' + jobId + '.b64';
+        try {
+          // Read the precompiled artifact's base64 and write it as the job tarball
+          if (fs.existsSync(precompiledB64Path)) {
+            const b64Data = fs.readFileSync(precompiledB64Path);
+            fs.writeFileSync(tarballB64Path, b64Data);
+          } else if (fs.existsSync(precompiledPath)) {
+            // Base64 encode the binary artifact
+            const binData = fs.readFileSync(precompiledPath);
+            fs.writeFileSync(tarballB64Path, binData.toString('base64'));
+          }
+        } catch (e: any) {
+          console.error('Failed to prepare precompiled bundle for finishing: ' + (e.message || e));
+        }
+      }
+
+      // Clean up the old job token — a new one will be generated on re-dispatch
+      jobTokens.delete(jobId);
+
+      // Notify CLI that signing is starting
+      const stageJson = '{"type":"stage","job_id":"' + jsonEscape(jobId) + '","stage":"signing","message":"Routing to Windows worker for signing and packaging..."}';
+      relayToCliClientsJson(jobId, stageJson);
+
+      // Re-queue the job for the finishing worker. Override targets to route to
+      // the correct worker (e.g. a worker advertising "windows" capability).
+      job.status = 'queued';
+      job.manifest.targets = [finishTarget];
+      jobQueue.unshift(job.id);
+      counters.queueLen++;
+
+      // Clean up verification state from this stage
+      verifyJobIdMap.delete(jobId);
+      verifyWorkerIdxMap.delete(jobId);
+      verifyArtifactPathMap.delete(jobId);
+      verifyStartTimeMap.delete(jobId);
+
+      tryDispatchNext();
+      return;
+    }
+
     if (job) {
       if (msg.success) {
         job.status = 'completed';
