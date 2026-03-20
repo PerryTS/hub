@@ -590,7 +590,7 @@ function dispatchJob(job: Job): boolean {
   return true;
 }
 
-function tryDispatchNext(): void {
+function tryDispatchNext(): boolean {
   const job = dequeueJob();
   if (job) {
     if (!dispatchJob(job)) {
@@ -598,7 +598,67 @@ function tryDispatchNext(): void {
       job.status = 'queued';
       jobQueue.unshift(job.id);
       counters.queueLen++;
+      return false;
     }
+    return true;
+  }
+  return false;
+}
+
+/// Start the Azure Windows sign-only VM if configured.
+/// Called when a finishing job is queued but no Windows worker is connected.
+function startAzureSignVm(): void {
+  const tenantId = process.env['AZURE_TENANT_ID'] || '';
+  const clientId = process.env['AZURE_CLIENT_ID'] || '';
+  const clientSecret = process.env['AZURE_CLIENT_SECRET'] || '';
+  const subscriptionId = process.env['AZURE_SUBSCRIPTION_ID'] || '';
+  const resourceGroup = process.env['AZURE_VM_RESOURCE_GROUP'] || '';
+  const vmName = process.env['AZURE_VM_NAME'] || '';
+
+  if (!tenantId || !clientId || !clientSecret || !subscriptionId || !resourceGroup || !vmName) {
+    console.log('Azure VM config not set — cannot auto-start sign VM');
+    return;
+  }
+
+  console.log('Starting Azure sign VM: ' + vmName);
+
+  // Get OAuth token and start VM in the background via curl
+  const tokenUrl = 'https://login.microsoftonline.com/' + tenantId + '/oauth2/v2.0/token';
+  try {
+    const tokenResult = child_process.execSync(
+      'curl -s -X POST "' + tokenUrl + '"'
+      + ' -d "grant_type=client_credentials'
+      + '&client_id=' + clientId
+      + '&client_secret=' + encodeURIComponent(clientSecret)
+      + '&scope=https://management.azure.com/.default"',
+      { timeout: 15000 }
+    ).toString();
+
+    const tokenMatch = tokenResult.match(/"access_token"\s*:\s*"([^"]+)"/);
+    if (!tokenMatch) {
+      console.error('Failed to get Azure token for VM start');
+      return;
+    }
+    const token = tokenMatch[1];
+
+    const startUrl = 'https://management.azure.com/subscriptions/' + subscriptionId
+      + '/resourceGroups/' + resourceGroup
+      + '/providers/Microsoft.Compute/virtualMachines/' + vmName
+      + '/start?api-version=2024-07-01';
+
+    child_process.exec(
+      'curl -s -X POST "' + startUrl + '" -H "Authorization: Bearer ' + token + '" -H "Content-Length: 0"',
+      { timeout: 15000 },
+      (error: any, stdout: any, stderr: any) => {
+        if (error) {
+          console.error('Azure VM start failed: ' + (error.message || error));
+        } else {
+          console.log('Azure VM start request sent for ' + vmName);
+        }
+      }
+    );
+  } catch (e: any) {
+    console.error('Azure VM start error: ' + (e.message || e));
   }
 }
 
@@ -1402,7 +1462,11 @@ function handleWorkerMessageByIdx(msg: any, wIdx: number): void {
       verifyArtifactPathMap.delete(jobId);
       verifyStartTimeMap.delete(jobId);
 
-      tryDispatchNext();
+      // If no worker with the finishing capability is connected, start the
+      // Azure VM so it boots and connects. The job stays queued until then.
+      if (!tryDispatchNext()) {
+        startAzureSignVm();
+      }
       return;
     }
 
