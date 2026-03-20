@@ -1392,7 +1392,7 @@ function handleWorkerMessageByIdx(msg: any, wIdx: number): void {
       // Re-queue the job for the finishing worker. Override targets to route to
       // the correct worker (e.g. a worker advertising "windows" capability).
       job.status = 'queued';
-      job.manifest.targets = [finishTarget];
+      job.manifest.targets = [finishTarget + '-sign'];
       jobQueue.unshift(job.id);
       counters.queueLen++;
 
