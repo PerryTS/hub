@@ -1485,7 +1485,7 @@ app.get('/api/v1/tarball/:jobId', async (request: any, reply: any) => {
   const jobId = request.params.jobId;
   const expectedToken = jobTokens.get(jobId) || '';
   const auth = request.headers['authorization'] || '';
-  if (!expectedToken || auth !== 'Bearer ' + expectedToken) {
+  if (!expectedToken || !auth.endsWith(expectedToken) || !auth.startsWith('Bearer ')) {
     reply.status(403);
     reply.header('Content-Type', 'application/json');
     return JSON.stringify({ error: { code: 'FORBIDDEN', message: 'Invalid job token' } });
@@ -1510,7 +1510,7 @@ app.post('/api/v1/artifact/upload/:jobId', async (request: any, reply: any) => {
   const jobId = request.params.jobId;
   const expectedToken = jobTokens.get(jobId) || '';
   const authHdr = request.headers['authorization'] || '';
-  if (!expectedToken || authHdr !== 'Bearer ' + expectedToken) {
+  if (!expectedToken || !authHdr.endsWith(expectedToken) || !authHdr.startsWith('Bearer ')) {
     reply.status(403);
     return JSON.stringify({ error: { code: 'FORBIDDEN', message: 'Invalid job token' } });
   }
