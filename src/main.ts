@@ -1194,7 +1194,10 @@ app.post('/api/v1/account/create', async (request: any, reply: any) => {
   reply.header('Content-Type', 'application/json');
   if (ADMIN_SECRET) {
     const auth = request.headers['authorization'] || '';
-    if (auth !== 'Bearer ' + ADMIN_SECRET) {
+    const expected = 'Bearer ' + ADMIN_SECRET;
+    console.log('account/create auth check: auth_len=' + String(auth.length) + ' expected_len=' + String(expected.length) + ' match=' + String(auth === expected));
+    console.log('account/create auth="' + auth.substring(0, 20) + '..." expected="' + expected.substring(0, 20) + '..."');
+    if (auth !== expected) {
       reply.status(403);
       return JSON.stringify({ error: { code: 'FORBIDDEN', message: 'Admin authentication required' } });
     }
