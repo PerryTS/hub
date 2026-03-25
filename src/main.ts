@@ -136,6 +136,22 @@ interface License {
   tier: 'free' | 'pro';
   github_username: string;
   platforms: string[];
+  account_id: string;       // '' if no account linked
+  device_bound: boolean;
+  project_bundle_id: string; // '' if not yet set
+}
+
+interface Account {
+  id: string;
+  github_username: string;
+  github_id: string;
+  email: string;
+  tier: 'free' | 'pro';
+  polar_customer_id: string;
+  polar_subscription_id: string;
+  api_token: string;
+  has_payment_method: boolean;
+  created_at: number;
 }
 
 interface RateLimitState {
@@ -177,6 +193,8 @@ interface ArtifactEntry {
 // --- In-memory stores ---
 
 const licenses = new Map<string, License>();
+const accounts = new Map<string, Account>();           // id -> Account
+const accountsByToken = new Map<string, string>();     // api_token -> account_id
 const rateLimits = new Map<string, RateLimitState>();
 const jobs = new Map<string, Job>();
 const jobQueue: string[] = []; // job IDs in priority order
@@ -268,7 +286,10 @@ async function initDb(): Promise<void> {
       githubUsername VARCHAR(255) NOT NULL DEFAULT '',
       platforms TEXT NOT NULL,
       createdAt BIGINT NOT NULL,
-      notes TEXT
+      notes TEXT,
+      account_id VARCHAR(36) DEFAULT NULL,
+      device_bound BOOLEAN NOT NULL DEFAULT FALSE,
+      project_bundle_id VARCHAR(255) DEFAULT NULL
     )`);
 
     await db.query(`CREATE TABLE IF NOT EXISTS builds (
@@ -286,7 +307,35 @@ async function initDb(): Promise<void> {
       INDEX idxLicenseKey (licenseKey)
     )`);
 
-    const result = await db.query('SELECT licenseKey, tier, githubUsername, platforms FROM licenses');
+    await db.query(`CREATE TABLE IF NOT EXISTS accounts (
+      id VARCHAR(36) PRIMARY KEY,
+      github_username VARCHAR(255) NOT NULL,
+      github_id VARCHAR(64) NOT NULL,
+      email VARCHAR(255) NOT NULL DEFAULT '',
+      tier VARCHAR(8) NOT NULL DEFAULT 'free',
+      polar_customer_id VARCHAR(64) DEFAULT NULL,
+      polar_subscription_id VARCHAR(64) DEFAULT NULL,
+      api_token VARCHAR(64) DEFAULT NULL,
+      has_payment_method BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at BIGINT NOT NULL,
+      UNIQUE INDEX idx_github_id (github_id),
+      UNIQUE INDEX idx_api_token (api_token)
+    )`);
+
+    await db.query(`CREATE TABLE IF NOT EXISTS usage_counters (
+      license_key VARCHAR(64) NOT NULL,
+      period VARCHAR(7) NOT NULL,
+      publishes INT NOT NULL DEFAULT 0,
+      deep_verifies INT NOT NULL DEFAULT 0,
+      PRIMARY KEY (license_key, period)
+    )`);
+
+    // Add new columns to licenses if they don't exist (migration for existing installs)
+    try { await db.query('ALTER TABLE licenses ADD COLUMN account_id VARCHAR(36) DEFAULT NULL'); } catch (e) { /* already exists */ }
+    try { await db.query('ALTER TABLE licenses ADD COLUMN device_bound BOOLEAN NOT NULL DEFAULT FALSE'); } catch (e) { /* already exists */ }
+    try { await db.query('ALTER TABLE licenses ADD COLUMN project_bundle_id VARCHAR(255) DEFAULT NULL'); } catch (e) { /* already exists */ }
+
+    const result = await db.query('SELECT licenseKey, tier, githubUsername, platforms, account_id, device_bound, project_bundle_id FROM licenses');
     const rows: any = result[0];
     for (let i = 0; i < rows.length; i++) {
       const row = rows[i];
@@ -295,10 +344,36 @@ async function initDb(): Promise<void> {
         tier: row.tier,
         github_username: row.githubUsername,
         platforms: JSON.parse(row.platforms),
+        account_id: row.account_id || '',
+        device_bound: row.device_bound ? true : false,
+        project_bundle_id: row.project_bundle_id || '',
       };
       licenses.set(license.key, license);
     }
-    console.log('DB ready, loaded ' + String(licenses.size) + ' licenses');
+    // Load accounts
+    const accResult = await db.query('SELECT id, github_username, github_id, email, tier, polar_customer_id, polar_subscription_id, api_token, has_payment_method, created_at FROM accounts');
+    const accRows: any = accResult[0];
+    for (let ai = 0; ai < accRows.length; ai++) {
+      const ar = accRows[ai];
+      const account: Account = {
+        id: ar.id,
+        github_username: ar.github_username,
+        github_id: ar.github_id,
+        email: ar.email || '',
+        tier: ar.tier,
+        polar_customer_id: ar.polar_customer_id || '',
+        polar_subscription_id: ar.polar_subscription_id || '',
+        api_token: ar.api_token || '',
+        has_payment_method: ar.has_payment_method ? true : false,
+        created_at: ar.created_at,
+      };
+      accounts.set(account.id, account);
+      if (account.api_token) {
+        accountsByToken.set(account.api_token, account.id);
+      }
+    }
+
+    console.log('DB ready, loaded ' + String(licenses.size) + ' licenses, ' + String(accounts.size) + ' accounts');
   } catch (e: any) {
     console.error('DB init error:', e.message || e);
   }
@@ -307,12 +382,88 @@ async function initDb(): Promise<void> {
 async function dbSaveLicense(license: License): Promise<void> {
   try {
     await db.execute(
-      'INSERT INTO licenses (licenseKey, tier, githubUsername, platforms, createdAt) VALUES (?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE tier=VALUES(tier), platforms=VALUES(platforms)',
-      [license.key, license.tier, license.github_username, JSON.stringify(license.platforms), Date.now()]
+      'INSERT INTO licenses (licenseKey, tier, githubUsername, platforms, createdAt, account_id, device_bound, project_bundle_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE tier=VALUES(tier), platforms=VALUES(platforms), account_id=VALUES(account_id), device_bound=VALUES(device_bound), project_bundle_id=VALUES(project_bundle_id)',
+      [license.key, license.tier, license.github_username, JSON.stringify(license.platforms), Date.now(), license.account_id || null, license.device_bound ? 1 : 0, license.project_bundle_id || null]
     );
   } catch (e: any) {
     console.error('dbSaveLicense error:', e.message || e);
   }
+}
+
+async function dbSaveAccount(account: Account): Promise<void> {
+  try {
+    await db.execute(
+      'INSERT INTO accounts (id, github_username, github_id, email, tier, polar_customer_id, polar_subscription_id, api_token, has_payment_method, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE tier=VALUES(tier), polar_customer_id=VALUES(polar_customer_id), polar_subscription_id=VALUES(polar_subscription_id), api_token=VALUES(api_token), has_payment_method=VALUES(has_payment_method), email=VALUES(email)',
+      [account.id, account.github_username, account.github_id, account.email, account.tier, account.polar_customer_id || null, account.polar_subscription_id || null, account.api_token || null, account.has_payment_method ? 1 : 0, account.created_at]
+    );
+  } catch (e: any) {
+    console.error('dbSaveAccount error:', e.message || e);
+  }
+}
+
+// --- Usage tracking ---
+
+function getCurrentPeriod(): string {
+  const d = new Date();
+  const y = String(d.getFullYear());
+  const m = String(d.getMonth() + 1);
+  const mm = m.length === 1 ? '0' + m : m;
+  return y + '-' + mm;
+}
+
+// In-memory usage cache (keyed by "licenseKey:YYYY-MM")
+const usageCache = new Map<string, { publishes: number; deep_verifies: number }>();
+
+async function getUsage(licenseKey: string): Promise<{ publishes: number; deep_verifies: number }> {
+  const period = getCurrentPeriod();
+  const cacheKey = licenseKey + ':' + period;
+  const cached = usageCache.get(cacheKey);
+  if (cached) return cached;
+
+  try {
+    const result = await db.query('SELECT publishes, deep_verifies FROM usage_counters WHERE license_key = ? AND period = ?', [licenseKey, period]);
+    const rows: any = result[0];
+    if (rows.length > 0) {
+      const usage = { publishes: rows[0].publishes, deep_verifies: rows[0].deep_verifies };
+      usageCache.set(cacheKey, usage);
+      return usage;
+    }
+  } catch (e: any) {
+    console.error('getUsage error:', e.message || e);
+  }
+  const fresh = { publishes: 0, deep_verifies: 0 };
+  usageCache.set(cacheKey, fresh);
+  return fresh;
+}
+
+async function incrementUsage(licenseKey: string, field: 'publishes' | 'deep_verifies'): Promise<void> {
+  const period = getCurrentPeriod();
+  const cacheKey = licenseKey + ':' + period;
+  try {
+    if (field === 'publishes') {
+      await db.execute(
+        'INSERT INTO usage_counters (license_key, period, publishes, deep_verifies) VALUES (?, ?, 1, 0) ON DUPLICATE KEY UPDATE publishes = publishes + 1',
+        [licenseKey, period]
+      );
+    } else {
+      await db.execute(
+        'INSERT INTO usage_counters (license_key, period, publishes, deep_verifies) VALUES (?, ?, 0, 1) ON DUPLICATE KEY UPDATE deep_verifies = deep_verifies + 1',
+        [licenseKey, period]
+      );
+    }
+    // Update cache
+    const cached = usageCache.get(cacheKey);
+    if (cached) {
+      if (field === 'publishes') cached.publishes++;
+      else cached.deep_verifies++;
+    }
+  } catch (e: any) {
+    console.error('incrementUsage error:', e.message || e);
+  }
+}
+
+function getPublishLimit(tier: 'free' | 'pro'): number {
+  return tier === 'pro' ? 50 : 15;
 }
 
 function dbInsertBuild(job: Job): void {
@@ -336,6 +487,52 @@ function dbBuildFinished(jobId: string, success: boolean, durationSecs: number, 
     'UPDATE builds SET status=?, completedAt=?, durationSecs=?, errorMessage=? WHERE id=?',
     [status, Date.now(), durationSecs, errorMsg, jobId]
   );
+
+  // Increment usage counter on successful build
+  if (success) {
+    const job = jobs.get(jobId);
+    if (job) {
+      incrementUsage(job.license_key, 'publishes');
+      // Report overage to Polar if applicable
+      reportOverageIfNeeded(job.license_key);
+    }
+  }
+}
+
+function reportOverageIfNeeded(licenseKey: string): void {
+  const license = licenses.get(licenseKey);
+  if (!license || !license.account_id) return;
+  const account = accounts.get(license.account_id);
+  if (!account || !account.polar_customer_id) return;
+
+  const polarToken = process.env.POLAR_ACCESS_TOKEN || '';
+  if (!polarToken) return;
+
+  const period = getCurrentPeriod();
+  const cacheKey = licenseKey + ':' + period;
+  const cached = usageCache.get(cacheKey);
+  if (!cached) return;
+
+  const limit = getPublishLimit(license.tier);
+  if (cached.publishes <= limit) return;
+
+  // Over the limit — report one overage event to Polar
+  const meterId = process.env.POLAR_METER_PUBLISH || '';
+  if (!meterId) return;
+
+  try {
+    child_process.exec(
+      'curl -s -X POST "https://api.polar.sh/v1/events" -H "Authorization: Bearer ' + polarToken + '" -H "Content-Type: application/json" -d \'{"customer_id":"' + account.polar_customer_id + '","meter_id":"' + meterId + '","value":1}\'',
+      { timeout: 10000 },
+      (error: any, stdout: any, stderr: any) => {
+        if (error) {
+          console.error('Polar overage report failed: ' + (error.message || error));
+        }
+      }
+    );
+  } catch (e: any) {
+    console.error('Polar overage report error: ' + (e.message || e));
+  }
 }
 
 // --- License store ---
@@ -350,12 +547,12 @@ function generateLicenseKey(tier: 'free' | 'pro'): string {
   return prefix + '-' + seg1 + '-' + seg2 + '-' + seg3;
 }
 
-function registerLicense(username: string, tier: 'free' | 'pro'): License {
+function registerLicense(username: string, tier: 'free' | 'pro', deviceBound: boolean): License {
   const key = generateLicenseKey(tier);
   const platforms = tier === 'pro'
     ? ['macos', 'ios', 'android', 'windows', 'linux']
     : ['macos'];
-  const license: License = { key, tier, github_username: username, platforms };
+  const license: License = { key, tier, github_username: username, platforms, account_id: '', device_bound: deviceBound, project_bundle_id: '' };
   licenses.set(key, license);
   return license;
 }
@@ -838,8 +1035,8 @@ app.post('/api/v1/admin/update-perry', async (request: any, reply: any) => {
   return '{"ok":true,"workers_notified":' + String(sent) + ',"expected_version":"' + jsonEscape(perryExpected.version) + '","workers":' + workersJson + '}';
 });
 
-// POST /api/v1/license/register
-app.post('/api/v1/license/register', async (request: any, reply: any) => {
+// GET /api/v1/admin/workers — read-only per-worker info (versions, capabilities, busy state)
+app.get('/api/v1/admin/workers', async (request: any, reply: any) => {
   reply.header('Content-Type', 'application/json');
 
   if (ADMIN_SECRET) {
@@ -850,10 +1047,29 @@ app.post('/api/v1/license/register', async (request: any, reply: any) => {
     }
   }
 
+  let workersJson = '[';
+  for (let wi = 0; wi < counters.workers; wi++) {
+    const wKey = 'w' + String(wi);
+    if (wi > 0) workersJson = workersJson + ',';
+    workersJson = workersJson + '{"name":"' + jsonEscape(workerNameMap.get(wKey) || '?')
+      + '","perry_version":"' + jsonEscape(workerVersionMap.get(wKey) || 'unknown')
+      + '","capabilities":"' + jsonEscape(workerCapMap.get(wKey) || ',')
+      + '","busy":' + String(workerBusyMap.get(wKey) || false) + '}';
+  }
+  workersJson = workersJson + ']';
+
+  return '{"expected_version":"' + jsonEscape(perryExpected.version) + '","workers":' + workersJson + '}';
+});
+
+// POST /api/v1/license/register
+// Public endpoint — free tier, device-bound licenses. No auth required.
+app.post('/api/v1/license/register', async (request: any, reply: any) => {
+  reply.header('Content-Type', 'application/json');
+
   let body: any = request.body || {};
 
   const username = body.github_username || '';
-  const license = registerLicense(username, 'free');
+  const license = registerLicense(username, 'free', true);
   await dbSaveLicense(license);
   return JSON.stringify({
     license_key: license.key,
@@ -877,6 +1093,162 @@ app.post('/api/v1/license/verify', async (request: any, reply: any) => {
   } else {
     return JSON.stringify({ valid: false, tier: null, platforms: null });
   }
+});
+
+// GET /api/v1/account — get account info and usage (requires Bearer token)
+app.get('/api/v1/account', async (request: any, reply: any) => {
+  reply.header('Content-Type', 'application/json');
+  const auth = request.headers['authorization'] || '';
+  if (!auth.startsWith('Bearer ')) {
+    reply.status(401);
+    return JSON.stringify({ error: { code: 'AUTH_REQUIRED', message: 'Authorization header required' } });
+  }
+  const token = auth.substring(7);
+  const accountId = accountsByToken.get(token);
+  if (!accountId) {
+    reply.status(401);
+    return JSON.stringify({ error: { code: 'AUTH_INVALID', message: 'Invalid API token' } });
+  }
+  const account = accounts.get(accountId);
+  if (!account) {
+    reply.status(401);
+    return JSON.stringify({ error: { code: 'AUTH_INVALID', message: 'Account not found' } });
+  }
+
+  // Find licenses linked to this account
+  let licenseKey = '';
+  licenses.forEach((lic: License, key: string) => {
+    if (lic.account_id === accountId && !licenseKey) {
+      licenseKey = key;
+    }
+  });
+
+  let usage = { publishes: 0, deep_verifies: 0 };
+  if (licenseKey) {
+    usage = await getUsage(licenseKey);
+  }
+
+  const limit = getPublishLimit(account.tier);
+  const verifyLimit = account.tier === 'pro' ? 20 : 2;
+
+  return JSON.stringify({
+    id: account.id,
+    github_username: account.github_username,
+    email: account.email,
+    tier: account.tier,
+    has_payment_method: account.has_payment_method,
+    usage: {
+      publishes: usage.publishes,
+      publish_limit: limit,
+      deep_verifies: usage.deep_verifies,
+      verify_limit: verifyLimit,
+      period: getCurrentPeriod(),
+    },
+  });
+});
+
+// POST /api/v1/account/update — dashboard updates account fields (tier, polar IDs)
+// Protected by ADMIN_SECRET (called by dashboard server, not directly by users)
+app.post('/api/v1/account/update', async (request: any, reply: any) => {
+  reply.header('Content-Type', 'application/json');
+  if (ADMIN_SECRET) {
+    const auth = request.headers['authorization'] || '';
+    if (auth !== 'Bearer ' + ADMIN_SECRET) {
+      reply.status(403);
+      return JSON.stringify({ error: { code: 'FORBIDDEN', message: 'Admin authentication required' } });
+    }
+  }
+  const body: any = request.body;
+  if (!body || !body.account_id) {
+    reply.status(400);
+    return JSON.stringify({ error: { code: 'BAD_REQUEST', message: 'account_id required' } });
+  }
+  const account = accounts.get(body.account_id);
+  if (!account) {
+    reply.status(404);
+    return JSON.stringify({ error: { code: 'NOT_FOUND', message: 'Account not found' } });
+  }
+  if (body.tier) account.tier = body.tier;
+  if (body.polar_customer_id) account.polar_customer_id = body.polar_customer_id;
+  if (body.polar_subscription_id) account.polar_subscription_id = body.polar_subscription_id;
+  if (body.has_payment_method !== undefined) account.has_payment_method = body.has_payment_method ? true : false;
+  await dbSaveAccount(account);
+
+  // Also update the tier on linked licenses
+  licenses.forEach((lic: License, key: string) => {
+    if (lic.account_id === body.account_id) {
+      lic.tier = account.tier;
+      if (account.tier === 'pro') {
+        lic.platforms = ['macos', 'ios', 'android', 'windows', 'linux'];
+      }
+      dbSaveLicense(lic);
+    }
+  });
+
+  return JSON.stringify({ ok: true });
+});
+
+// POST /api/v1/account/create — dashboard creates account after GitHub OAuth
+// Protected by ADMIN_SECRET
+app.post('/api/v1/account/create', async (request: any, reply: any) => {
+  reply.header('Content-Type', 'application/json');
+  if (ADMIN_SECRET) {
+    const auth = request.headers['authorization'] || '';
+    if (auth !== 'Bearer ' + ADMIN_SECRET) {
+      reply.status(403);
+      return JSON.stringify({ error: { code: 'FORBIDDEN', message: 'Admin authentication required' } });
+    }
+  }
+  const body: any = request.body;
+  if (!body || !body.github_id || !body.github_username) {
+    reply.status(400);
+    return JSON.stringify({ error: { code: 'BAD_REQUEST', message: 'github_id and github_username required' } });
+  }
+
+  // Check for existing account by github_id
+  let existingAccount: Account | null = null;
+  accounts.forEach((acc: Account) => {
+    if (acc.github_id === body.github_id && !existingAccount) {
+      existingAccount = acc;
+    }
+  });
+
+  if (existingAccount) {
+    // Return existing account
+    return JSON.stringify({
+      id: (existingAccount as Account).id,
+      api_token: (existingAccount as Account).api_token,
+      github_username: (existingAccount as Account).github_username,
+      tier: (existingAccount as Account).tier,
+      created: false,
+    });
+  }
+
+  const id = crypto.randomUUID();
+  const apiToken = crypto.randomUUID();
+  const account: Account = {
+    id,
+    github_username: body.github_username,
+    github_id: body.github_id,
+    email: body.email || '',
+    tier: 'free',
+    polar_customer_id: '',
+    polar_subscription_id: '',
+    api_token: apiToken,
+    has_payment_method: false,
+    created_at: Date.now(),
+  };
+  accounts.set(id, account);
+  accountsByToken.set(apiToken, id);
+  await dbSaveAccount(account);
+
+  return JSON.stringify({
+    id: account.id,
+    api_token: account.api_token,
+    github_username: account.github_username,
+    tier: account.tier,
+    created: true,
+  });
 });
 
 // POST /api/v1/build
@@ -913,10 +1285,6 @@ app.post('/api/v1/build', async (request: any, reply: any) => {
     else if (p.name === 'tarball_b64') tarballB64Part = p;
   }
 
-  if (!licensePart) {
-    reply.status(400);
-    return JSON.stringify({ error: { code: 'BAD_REQUEST', message: "Missing 'license_key' field" } });
-  }
   if (!manifestPart) {
     reply.status(400);
     return JSON.stringify({ error: { code: 'BAD_REQUEST', message: "Missing 'manifest' field" } });
@@ -926,7 +1294,6 @@ app.post('/api/v1/build', async (request: any, reply: any) => {
     return JSON.stringify({ error: { code: 'BAD_REQUEST', message: "Missing 'tarball_b64' field" } });
   }
 
-  const licenseKey = licensePart.data;
   let manifest: any;
   try {
     manifest = JSON.parse(manifestPart.data);
@@ -945,11 +1312,104 @@ app.post('/api/v1/build', async (request: any, reply: any) => {
     }
   }
 
-  // Validate license
-  const license = verifyLicense(licenseKey);
-  if (!license) {
-    reply.status(401);
-    return JSON.stringify({ error: { code: 'LICENSE_INVALID', message: 'Invalid license key' } });
+  // --- Authenticate: API token (Bearer header) or license key (multipart field) ---
+  let license: License | null = null;
+  const authHeader = request.headers['authorization'] || '';
+
+  if (authHeader.startsWith('Bearer ')) {
+    // API token auth — look up account, find or create license
+    const token = authHeader.substring(7);
+    const accountId = accountsByToken.get(token);
+    if (!accountId) {
+      reply.status(401);
+      return JSON.stringify({ error: { code: 'AUTH_INVALID', message: 'Invalid API token' } });
+    }
+    const account = accounts.get(accountId);
+    if (!account) {
+      reply.status(401);
+      return JSON.stringify({ error: { code: 'AUTH_INVALID', message: 'Account not found' } });
+    }
+
+    // Find existing license linked to this account, or create one
+    let foundKey = '';
+    licenses.forEach((lic: License, key: string) => {
+      if (lic.account_id === accountId && !foundKey) {
+        foundKey = key;
+      }
+    });
+    if (foundKey) {
+      license = licenses.get(foundKey) || null;
+    }
+    if (!license) {
+      // Create a license linked to this account
+      const newLic = registerLicense(account.github_username, account.tier, false);
+      newLic.account_id = accountId;
+      license = newLic;
+      licenses.set(newLic.key, newLic);
+      dbSaveLicense(newLic);
+    }
+    // Sync tier from account (account tier is authoritative for logged-in users)
+    if (license.tier !== account.tier) {
+      license.tier = account.tier;
+      dbSaveLicense(license);
+    }
+  } else {
+    // License key auth (legacy / device-bound flow)
+    if (!licensePart) {
+      reply.status(400);
+      return JSON.stringify({ error: { code: 'BAD_REQUEST', message: "Missing 'license_key' field or Authorization header" } });
+    }
+    const licenseKey = licensePart.data;
+    license = verifyLicense(licenseKey);
+    if (!license) {
+      reply.status(401);
+      return JSON.stringify({ error: { code: 'LICENSE_INVALID', message: 'Invalid license key' } });
+    }
+  }
+
+  // --- Device-bound project enforcement ---
+  if (license.device_bound && !license.account_id) {
+    const bundleId = manifest.bundle_id || manifest.name || '';
+    if (bundleId) {
+      if (!license.project_bundle_id) {
+        // First build — bind to this project
+        license.project_bundle_id = bundleId;
+        dbSaveLicense(license);
+      } else if (license.project_bundle_id !== bundleId) {
+        // Different project — require account
+        reply.status(403);
+        return JSON.stringify({
+          error: {
+            code: 'ACCOUNT_REQUIRED',
+            message: 'Free device licenses support one project. Run \'perry login\' to create an account and publish multiple projects.',
+            login_url: 'https://app.perryts.com/cli/authorize',
+          },
+        });
+      }
+    }
+  }
+
+  // --- Usage enforcement (skip for self-hosted) ---
+  if (!isSelfHosted()) {
+    const usage = await getUsage(license.key);
+    const limit = getPublishLimit(license.tier);
+
+    if (usage.publishes >= limit) {
+      // Pro users with Polar billing can exceed (overage billed)
+      if (license.tier === 'pro' && license.account_id) {
+        // Allow — overage will be reported on build completion
+      } else {
+        // Hard block for free tier
+        reply.status(429);
+        return JSON.stringify({
+          error: {
+            code: 'PUBLISH_LIMIT_REACHED',
+            message: 'You\'ve used ' + String(usage.publishes) + '/' + String(limit) + ' free publishes this month. Resets on the 1st. Run \'perry login\' to upgrade to Pro ($19/mo, 50 publishes).',
+            usage: { publishes: usage.publishes, limit: limit, period: getCurrentPeriod() },
+          },
+        });
+      }
+    }
   }
 
   // Check rate limits (skip for self-hosted)
