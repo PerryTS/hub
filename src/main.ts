@@ -989,7 +989,7 @@ app.post('/api/v1/admin/update-perry', async (request: any, reply: any) => {
 
   if (ADMIN_SECRET) {
     const auth = request.headers['authorization'] || '';
-    if (auth !== 'Bearer ' + ADMIN_SECRET) {
+    if (!auth.endsWith(ADMIN_SECRET) || !auth.startsWith('Bearer ')) {
       reply.status(403);
       return JSON.stringify({ error: { code: 'FORBIDDEN', message: 'Admin authentication required' } });
     }
@@ -1041,7 +1041,7 @@ app.get('/api/v1/admin/workers', async (request: any, reply: any) => {
 
   if (ADMIN_SECRET) {
     const auth = request.headers['authorization'] || '';
-    if (auth !== 'Bearer ' + ADMIN_SECRET) {
+    if (!auth.endsWith(ADMIN_SECRET) || !auth.startsWith('Bearer ')) {
       reply.status(403);
       return JSON.stringify({ error: { code: 'FORBIDDEN', message: 'Admin authentication required' } });
     }
@@ -1153,7 +1153,7 @@ app.post('/api/v1/account/update', async (request: any, reply: any) => {
   reply.header('Content-Type', 'application/json');
   if (ADMIN_SECRET) {
     const auth = request.headers['authorization'] || '';
-    if (auth !== 'Bearer ' + ADMIN_SECRET) {
+    if (!auth.endsWith(ADMIN_SECRET) || !auth.startsWith('Bearer ')) {
       reply.status(403);
       return JSON.stringify({ error: { code: 'FORBIDDEN', message: 'Admin authentication required' } });
     }
