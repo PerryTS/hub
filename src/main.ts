@@ -578,9 +578,8 @@ function checkRateLimit(licenseKey: string, tier: 'free' | 'pro', uploadSize: nu
     rateLimits.set(licenseKey, state);
   }
 
-  if (state.active_builds >= maxConcurrent) {
-    return `Concurrent build limit reached (${maxConcurrent})`;
-  }
+  // Don't reject for concurrent builds — just queue them.
+  // The worker dispatch handles queueing naturally.
 
   const oneHourAgo = Date.now() - 3600_000;
   state.recent_builds = state.recent_builds.filter(t => t > oneHourAgo);
