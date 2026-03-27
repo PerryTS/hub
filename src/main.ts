@@ -213,7 +213,9 @@ function jsonEscape(s: string): string {
 const workerCapMap = new Map<string, string>(); // "w0" -> ",macos,ios,android,"
 const workerNameMap = new Map<string, string>(); // "w0" -> "macbook-intel"
 const workerHandleMap = new Map<string, number>(); // "w0" -> clientHandle
-const workerBusyMap = new Map<string, boolean>(); // "w0" -> false
+const workerBusyMap = new Map<string, boolean>(); // "w0" -> false (legacy)
+const workerActiveJobsMap = new Map<string, number>(); // "w0" -> 0
+const workerMaxConcurrentMap = new Map<string, number>(); // "w0" -> 2
 const workerJobMap = new Map<string, string>(); // "w0" -> current_job_id or ""
 const workerVersionMap = new Map<string, string>(); // "w0" -> "0.2.181"
 // Precomputed JSON string of supported targets (rebuilt on worker connect/disconnect)
@@ -680,9 +682,10 @@ function getAvailableWorkerIdx(requiredCaps: string[], reqLen: number): number {
   for (let wi = 0; wi < counters.workers; wi++) {
     const wKey = 'w' + String(wi);
     const wName = workerNameMap.get(wKey) || '?';
-    const wBusy = workerBusyMap.get(wKey) || false;
-    console.log('getAvailableWorkerIdx: ' + wKey + ' name=' + wName + ' busy=' + String(wBusy));
-    if (!wBusy) {
+    const wActive = workerActiveJobsMap.get(wKey) || 0;
+    const wMaxConcurrent = workerMaxConcurrentMap.get(wKey) || 1;
+    console.log('getAvailableWorkerIdx: ' + wKey + ' name=' + wName + ' active=' + String(wActive) + '/' + String(wMaxConcurrent));
+    if (wActive < wMaxConcurrent) {
       let hasAll = true;
       for (let ri = 0; ri < reqLen; ri++) {
         const hasCap = workerIdxHasCapability(wi, requiredCaps[ri]);
@@ -757,6 +760,7 @@ function dispatchJob(job: Job): boolean {
   const wHandle = workerHandleMap.get(wKey) || 0;
   console.log('dispatchJob: dispatching to ' + wName + ' (handle=' + String(wHandle) + ')');
 
+  workerActiveJobsMap.set(wKey, (workerActiveJobsMap.get(wKey) || 0) + 1);
   workerBusyMap.set(wKey, true);
   workerJobMap.set(wKey, job.id);
   job.status = 'running';
@@ -778,6 +782,7 @@ function dispatchJob(job: Job): boolean {
   } catch (e) {
     jobTokens.delete(job.id);
     workerBusyMap.set(wKey, false);
+    workerActiveJobsMap.set(wKey, 0);
     workerJobMap.set(wKey, '');
     job.status = 'queued';
     return false;
@@ -1466,12 +1471,19 @@ app.get('/api/v1/dl/:token', async (request: any, reply: any) => {
   }
 
   try {
-    const data = fs.readFileSync(entry.path);
-    reply.header('Content-Type', 'application/octet-stream');
+    // Serve base64 version — Perry runtime can't reliably send raw binary
+    const b64Path = entry.path + '.b64';
+    let responseData: any;
+    if (fs.existsSync(b64Path)) {
+      responseData = fs.readFileSync(b64Path);
+      reply.header('Content-Type', 'text/plain');
+    } else {
+      responseData = fs.readFileSync(entry.path);
+      reply.header('Content-Type', 'application/octet-stream');
+    }
     const safeName = entry.name.replace(/[^a-zA-Z0-9._-]/g, '_');
     reply.header('Content-Disposition', `attachment; filename="${safeName}"`);
-    reply.header('Content-Length', String(entry.size));
-    return data;
+    return responseData;
   } catch (e: any) {
     reply.status(500);
     reply.header('Content-Type', 'application/json');
@@ -1635,7 +1647,9 @@ wss.on('message', (clientHandle: any, data: any) => {
       workerCapMap.set(wKey, capStr);
       workerNameMap.set(wKey, workerName);
       workerHandleMap.set(wKey, clientHandle);
-      workerBusyMap.set(wKey, false);
+      workerActiveJobsMap.set(wKey, 0);
+    workerMaxConcurrentMap.set(wKey, msg.max_concurrent || 1);
+      workerBusyMap.set(wKey, (workerActiveJobsMap.get(wKey) || 0) > 0);
       workerJobMap.set(wKey, '');
       const workerVersion = msg.perry_version || '';
       workerVersionMap.set(wKey, workerVersion);
@@ -1863,7 +1877,9 @@ function handleWorkerMessageByIdx(msg: any, wIdx: number): void {
       }
       const completeJson = '{"type":"complete","job_id":"' + jsonEscape(jobId) + '","success":true,"duration_secs":' + String(msg.duration_secs || 0) + ',"artifacts":[]}';
       relayToCliClientsJson(jobId, completeJson);
-      workerBusyMap.set(wKey, false);
+      workerActiveJobsMap.set(wKey, 0);
+    workerMaxConcurrentMap.set(wKey, msg.max_concurrent || 1);
+      workerBusyMap.set(wKey, (workerActiveJobsMap.get(wKey) || 0) > 0);
       workerJobMap.set(wKey, '');
       tryDispatchNext();
     }
@@ -1880,7 +1896,9 @@ function handleWorkerMessageByIdx(msg: any, wIdx: number): void {
       console.log('Job ' + jobId + ' needs finishing by ' + finishTarget + ' worker');
 
       // Free the current worker (Linux) so it can take new jobs
-      workerBusyMap.set(wKey, false);
+      workerActiveJobsMap.set(wKey, 0);
+    workerMaxConcurrentMap.set(wKey, msg.max_concurrent || 1);
+      workerBusyMap.set(wKey, (workerActiveJobsMap.get(wKey) || 0) > 0);
       workerJobMap.set(wKey, '');
 
       // Replace the original tarball with the precompiled artifact bundle
