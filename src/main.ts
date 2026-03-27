@@ -1877,8 +1877,7 @@ function handleWorkerMessageByIdx(msg: any, wIdx: number): void {
       }
       const completeJson = '{"type":"complete","job_id":"' + jsonEscape(jobId) + '","success":true,"duration_secs":' + String(msg.duration_secs || 0) + ',"artifacts":[]}';
       relayToCliClientsJson(jobId, completeJson);
-      workerActiveJobsMap.set(wKey, 0);
-    workerMaxConcurrentMap.set(wKey, msg.max_concurrent || 1);
+      workerActiveJobsMap.set(wKey, Math.max(0, (workerActiveJobsMap.get(wKey) || 1) - 1));
       workerBusyMap.set(wKey, (workerActiveJobsMap.get(wKey) || 0) > 0);
       workerJobMap.set(wKey, '');
       tryDispatchNext();
@@ -1896,8 +1895,7 @@ function handleWorkerMessageByIdx(msg: any, wIdx: number): void {
       console.log('Job ' + jobId + ' needs finishing by ' + finishTarget + ' worker');
 
       // Free the current worker (Linux) so it can take new jobs
-      workerActiveJobsMap.set(wKey, 0);
-    workerMaxConcurrentMap.set(wKey, msg.max_concurrent || 1);
+      workerActiveJobsMap.set(wKey, Math.max(0, (workerActiveJobsMap.get(wKey) || 1) - 1));
       workerBusyMap.set(wKey, (workerActiveJobsMap.get(wKey) || 0) > 0);
       workerJobMap.set(wKey, '');
 
@@ -1926,7 +1924,7 @@ function handleWorkerMessageByIdx(msg: any, wIdx: number): void {
       jobTokens.delete(jobId);
 
       // Notify CLI that signing is starting
-      const stageJson = '{"type":"stage","job_id":"' + jsonEscape(jobId) + '","stage":"signing","message":"Routing to Windows worker for signing and packaging..."}';
+      const stageJson = '{"type":"stage","job_id":"' + jsonEscape(jobId) + '","stage":"signing","message":"Routing to platform worker for signing and packaging..."}';
       relayToCliClientsJson(jobId, stageJson);
 
       // Re-queue the job for the finishing worker. Override targets to route to
