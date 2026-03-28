@@ -2,7 +2,10 @@
 
 Public-facing build server for the Perry ecosystem. Receives build uploads from
 the `perry publish` CLI, manages licenses, and dispatches build jobs to workers
-via WebSocket.
+via WebSocket. Orchestrates the multi-stage build pipeline: Linux worker compiles
+all platforms, then hub re-queues precompiled bundles as sign-only jobs to
+platform-specific sign workers (macOS worker for ios-sign/macos-sign, Azure VM
+for windows-sign).
 
 ## Tech Stack
 - **TypeScript** compiled to native binary by the [perry compiler](https://github.com/PerryTS/perry)
@@ -45,6 +48,8 @@ See memory file `perry-quirks.md` for the full list.
 - **Licenses**: MySQL-backed, cached in-memory Map
 - **Job queue**: priority-ordered (pro tier > free tier)
 - **Worker pool**: workers connect via WS, identified by platform capabilities
+- **Slot-based dispatch**: `workerActiveJobsMap` / `workerMaxConcurrentMap` for concurrent builds
+- **Re-queue pipeline**: Linux worker uploads precompiled bundles → hub re-queues as `ios-sign`/`macos-sign`/`windows-sign` to appropriate sign workers
 - **Artifacts**: temp files in `/tmp/perry-artifacts/`, auto-cleaned after TTL
 - **Rate limiting**: per-license concurrent + hourly limits
 
@@ -58,6 +63,12 @@ See memory file `perry-quirks.md` for the full list.
 - `PERRY_HUB_ARTIFACT_TTL_SECS` — artifact expiry (default: 600)
 - `PERRY_DB_HOST`, `PERRY_DB_PORT`, `PERRY_DB_USER`, `PERRY_DB_PASSWORD`, `PERRY_DB_NAME` — MySQL connection
 
+## Workers
+- **Linux worker** (84.32.98.120): compiles ALL platforms (linux, android, windows, ios, macos)
+- **macOS worker** (oakhost-tart): sign-only for `macos-sign` and `ios-sign` jobs
+- **Windows Azure VM** (perry-sign-win): sign-only for `windows-sign` jobs, auto-start/stop
+
 ## Related Repos
 - [perry](https://github.com/PerryTS/perry) — compiler + CLI
-- [builder-macos](https://github.com/PerryTS/builder-macos) — macOS build worker
+- [builder-linux](https://github.com/PerryTS/builder-linux) — Linux worker (all compilation)
+- [builder-macos](https://github.com/PerryTS/builder-macos) — macOS/iOS sign-only worker
