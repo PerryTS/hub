@@ -1602,6 +1602,7 @@ wss.on('connection', (clientHandle: any) => {
 
 // Message event: server-level, receives (clientHandle, data)
 wss.on('message', (clientHandle: any, data: any) => {
+  try {
   let msg: any;
   try {
     msg = JSON.parse(data);
@@ -1710,10 +1711,14 @@ wss.on('message', (clientHandle: any, data: any) => {
   } else if (role === 'cli') {
     handleCliMessage(msg, clientHandle);
   }
+  } catch (e: any) {
+    console.error('WebSocket message handler error:', e);
+  }
 });
 
 // Close event: server-level, receives (clientHandle)
 wss.on('close', (clientHandle: any) => {
+  try {
   const role = getClientRole(clientHandle);
   if (!role) {
     removeClient(clientHandle);
@@ -1809,6 +1814,9 @@ wss.on('close', (clientHandle: any) => {
   }
 
   removeClient(clientHandle);
+  } catch (e: any) {
+    console.error('WebSocket close handler error:', e);
+  }
 });
 
 wss.on('error', (err: any) => {
