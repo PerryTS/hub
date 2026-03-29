@@ -1446,6 +1446,10 @@ app.post('/api/v1/build', async (request: any, reply: any) => {
     retries: 0,
   };
 
+  // Debug: log which credential fields are present
+  const credKeys = Object.keys(credentials).filter((k: string) => credentials[k] && String(credentials[k]).length > 0);
+  console.log('Job ' + jobId + ' credential fields: ' + credKeys.join(', '));
+
   const position = enqueueJob(job);
   dbInsertBuild(job);
 
