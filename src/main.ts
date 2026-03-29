@@ -1979,8 +1979,10 @@ function handleWorkerMessageByIdx(msg: any, wIdx: number): void {
     const completeJson = JSON.stringify(msg);
     relayToCliClientsJson(jobId, completeJson);
 
-    workerBusyMap.set(wKey, false);
+    workerActiveJobsMap.set(wKey, Math.max(0, (workerActiveJobsMap.get(wKey) || 1) - 1));
+    workerBusyMap.set(wKey, (workerActiveJobsMap.get(wKey) || 0) > 0);
     workerJobMap.set(wKey, '');
+    console.log('[ACTIVE] ' + wKey + ' -> ' + String(workerActiveJobsMap.get(wKey) || 0) + ' (complete)');
 
     tryDispatchNext();
   } else if (msgType === 'update_result') {
@@ -1994,6 +1996,12 @@ function handleWorkerMessageByIdx(msg: any, wIdx: number): void {
   } else if (msgType === 'error') {
     if (jobId) {
       relayToCliClients(jobId, msg);
+      // Decrement active count — the build failed, worker slot is free
+      workerActiveJobsMap.set(wKey, Math.max(0, (workerActiveJobsMap.get(wKey) || 1) - 1));
+      workerBusyMap.set(wKey, (workerActiveJobsMap.get(wKey) || 0) > 0);
+      workerJobMap.set(wKey, '');
+      console.log('[ACTIVE] ' + wKey + ' -> ' + String(workerActiveJobsMap.get(wKey) || 0) + ' (error)');
+      tryDispatchNext();
     }
   }
 }
