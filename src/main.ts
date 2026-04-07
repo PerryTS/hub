@@ -1475,16 +1475,16 @@ app.get('/api/v1/dl/:token', async (request: any, reply: any) => {
   }
 
   try {
-    // Serve base64 version — Perry runtime can't reliably send raw binary
+    // entry.path stores base64 text. Pass 'utf8' so perry returns a string
+    // (Buffer-typed reads have a 4-byte offset bug — see /api/v1/tarball below).
     const b64Path = entry.path + '.b64';
     let responseData: any;
     if (fs.existsSync(b64Path)) {
-      responseData = fs.readFileSync(b64Path);
-      reply.header('Content-Type', 'text/plain');
+      responseData = fs.readFileSync(b64Path, 'utf8');
     } else {
-      responseData = fs.readFileSync(entry.path);
-      reply.header('Content-Type', 'application/octet-stream');
+      responseData = fs.readFileSync(entry.path, 'utf8');
     }
+    reply.header('Content-Type', 'text/plain');
     const safeName = entry.name.replace(/[^a-zA-Z0-9._-]/g, '_');
     reply.header('Content-Disposition', `attachment; filename="${safeName}"`);
     return responseData;
@@ -1507,7 +1507,11 @@ app.get('/api/v1/tarball/:jobId', async (request: any, reply: any) => {
   }
   const b64Path = TARBALL_DIR + '/' + jobId + '.b64';
   try {
-    const b64Data = fs.readFileSync(b64Path);
+    // IMPORTANT: pass 'utf8' encoding so perry returns a string, not a Buffer.
+    // Perry's Buffer-typed fs.readFileSync return value has a 4-byte offset bug
+    // that corrupts the first 4 chars (becomes garbage) and appends 4 NULL bytes
+    // at the end, breaking base64 decoding on the worker side.
+    const b64Data = fs.readFileSync(b64Path, 'utf8');
     reply.header('Content-Type', 'text/plain');
     return b64Data;
   } catch (e: any) {
@@ -1918,14 +1922,14 @@ function handleWorkerMessageByIdx(msg: any, wIdx: number): void {
         const precompiledB64Path = precompiledPath + '.b64';
         const tarballB64Path = TARBALL_DIR + '/' + jobId + '.b64';
         try {
-          // Read the precompiled artifact's base64 and write it as the job tarball
+          // Read the precompiled artifact's base64 and write it as the job tarball.
+          // Use 'utf8' to avoid perry's Buffer-typed read 4-byte offset bug.
           if (fs.existsSync(precompiledB64Path)) {
-            const b64Data = fs.readFileSync(precompiledB64Path);
+            const b64Data = fs.readFileSync(precompiledB64Path, 'utf8');
             fs.writeFileSync(tarballB64Path, b64Data);
           } else if (fs.existsSync(precompiledPath)) {
-            // Base64 encode the binary artifact
-            const binData = fs.readFileSync(precompiledPath);
-            fs.writeFileSync(tarballB64Path, binData.toString('base64'));
+            const b64Data = fs.readFileSync(precompiledPath, 'utf8');
+            fs.writeFileSync(tarballB64Path, b64Data);
           }
         } catch (e: any) {
           console.error('Failed to prepare precompiled bundle for finishing: ' + (e.message || e));
@@ -2209,6 +2213,17 @@ function sendVerifyResult(buildJobId: string, wIdx: number, passed: boolean, rea
 // --- Start servers ---
 
 startArtifactCleanup();
+
+// Periodically trigger Perry GC. Fastify's event loop doesn't yield to perry's
+// timer-tick GC checkpoint (perry only emits gc_check_trigger_export inside the
+// setInterval/setTimeout loop body, which Fastify bypasses), so without this
+// the runtime's malloc tracking accumulates from request bodies, JSON parsing,
+// fs.readFileSync, etc. and RSS grows unbounded until systemd OOMs the service.
+// 30s interval is a balance between collection overhead and bounding growth
+// under heavy build load.
+setInterval(() => {
+  gc();
+}, 30000);
 
 // Register WS event handlers BEFORE app.listen() since it enters the event loop and never returns
 wss.on('listening', () => {
