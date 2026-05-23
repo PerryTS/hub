@@ -22,7 +22,7 @@ function parseMultipart(body: string, contentType: string): MultipartPart[] {
   // Extract boundary from Content-Type header
   const boundaryMatch = contentType.match(/boundary=([^\s;]+)/);
   if (!boundaryMatch) return [];
-  const boundary = boundaryMatch[1].replace(/^"(.*)"$/, '$1');
+  let boundary = boundaryMatch[1]; if (boundary.startsWith("\"") && boundary.endsWith("\"") && boundary.length >= 2) { boundary = boundary.substring(1, boundary.length - 1); }
 
   const delimiter = '--' + boundary;
   const endDelimiter = delimiter + '--';
@@ -90,6 +90,13 @@ const WS_PORT = parseInt(process.env.PERRY_HUB_WS_PORT || '3457', 10);
 const ARTIFACT_TTL_SECS = parseInt(process.env.PERRY_HUB_ARTIFACT_TTL_SECS || '600', 10);
 const WORKER_SECRET = process.env.PERRY_HUB_WORKER_SECRET || '';
 const ADMIN_SECRET = process.env.PERRY_HUB_ADMIN_SECRET || '';
+// Gate verbose per-dispatch logging. Left ungated, getAvailableWorkerIdx /
+// dispatchJob / [DBG] manifest dumps log ~12 synchronous lines (with manifest
+// JSON.stringify) per dispatch ATTEMPT — and tryDispatchNext re-attempts every
+// queued job on every event, so unschedulable jobs (e.g. tvos waiting on a busy
+// worker) turn it into an O(queue x events) stdout storm that blocked the event
+// loop for up to ~29s under a build burst. Default off.
+const HUB_DEBUG = process.env.PERRY_HUB_DEBUG === '1';
 
 function isSelfHosted(): boolean {
   const v = process.env.PERRY_HUB_SELF_HOSTED || '';
@@ -200,6 +207,10 @@ const jobs = new Map<string, Job>();
 const jobQueue: string[] = []; // job IDs in priority order
 const workerList: WorkerInfo[] = [];
 const counters = { workers: 0, queueLen: 0 };
+// --- event-loop diagnostics (temporary; confirms WS-relay contention) ---
+// wsMsgs counts WS messages handled per 1s window; the interval below measures
+// how late its own tick fires (event-loop lag) — a blocked loop fires late.
+const _diag = { wsMsgs: 0, lastTick: Date.now() };
 const artifacts = new Map<string, ArtifactEntry>();
 const jobTokens = new Map<string, string>(); // job_id -> bearer token for worker auth
 
@@ -281,8 +292,10 @@ function removeClient(handle: any): void {
 // --- DB init and helpers ---
 
 async function initDb(): Promise<void> {
+  console.log("[INIT-DBG] initDb called");
   try {
-    await db.query(`CREATE TABLE IF NOT EXISTS licenses (
+    console.log("[INIT-DBG] before first db.query");
+    const _q1res = await db.query(`CREATE TABLE IF NOT EXISTS licenses (
       licenseKey VARCHAR(64) PRIMARY KEY,
       tier VARCHAR(8) NOT NULL DEFAULT 'free',
       githubUsername VARCHAR(255) NOT NULL DEFAULT '',
@@ -370,13 +383,17 @@ async function initDb(): Promise<void> {
         created_at: ar.created_at,
       };
       accounts.set(account.id, account);
+      console.log("[LOAD-DBG] account " + account.github_username + " token_len=" + account.api_token.length);
       if (account.api_token) {
         accountsByToken.set(account.api_token, account.id);
+        console.log("[LOAD-DBG] after set, accountsByToken.size=" + accountsByToken.size);
       }
     }
 
+    console.log("[INIT-DBG] before DB ready log");
     console.log('DB ready, loaded ' + String(licenses.size) + ' licenses, ' + String(accounts.size) + ' accounts');
   } catch (e: any) {
+    console.log("[INIT-DBG] caught error in initDb");
     console.error('DB init error:', e.message || e);
   }
 }
@@ -663,7 +680,7 @@ function rebuildTargetsJson(): void {
   }
   json = json + ']';
   cached.targetsJson = json;
-  console.log('rebuildTargetsJson: ' + json);
+  if (HUB_DEBUG) console.log('rebuildTargetsJson: ' + json);
 }
 
 function workerIdxHasCapability(wi: number, cap: string): boolean {
@@ -678,25 +695,25 @@ function workerIdxHasCapability(wi: number, cap: string): boolean {
 
 // Returns worker INDEX (not the worker object, which has corrupted properties in perry)
 function getAvailableWorkerIdx(requiredCaps: string[], reqLen: number): number {
-  console.log('getAvailableWorkerIdx: checking ' + String(counters.workers) + ' workers for ' + String(reqLen) + ' caps');
+  if (HUB_DEBUG) console.log('getAvailableWorkerIdx: checking ' + String(counters.workers) + ' workers for ' + String(reqLen) + ' caps');
   for (let wi = 0; wi < counters.workers; wi++) {
     const wKey = 'w' + String(wi);
     const wName = workerNameMap.get(wKey) || '?';
     const wActive = workerActiveJobsMap.get(wKey) || 0;
     const wMaxConcurrent = workerMaxConcurrentMap.get(wKey) || 1;
-    console.log('getAvailableWorkerIdx: ' + wKey + ' name=' + wName + ' active=' + String(wActive) + '/' + String(wMaxConcurrent));
+    if (HUB_DEBUG) console.log('getAvailableWorkerIdx: ' + wKey + ' name=' + wName + ' active=' + String(wActive) + '/' + String(wMaxConcurrent));
     if (wActive < wMaxConcurrent) {
       let hasAll = true;
       for (let ri = 0; ri < reqLen; ri++) {
         const hasCap = workerIdxHasCapability(wi, requiredCaps[ri]);
-        console.log('getAvailableWorkerIdx: ' + wKey + ' cap=' + requiredCaps[ri] + ' has=' + String(hasCap));
+        if (HUB_DEBUG) console.log('getAvailableWorkerIdx: ' + wKey + ' cap=' + requiredCaps[ri] + ' has=' + String(hasCap));
         if (!hasCap) {
           hasAll = false;
           break;
         }
       }
       if (hasAll) {
-        console.log('getAvailableWorkerIdx: selected ' + wKey + ' name=' + wName);
+        if (HUB_DEBUG) console.log('getAvailableWorkerIdx: selected ' + wKey + ' name=' + wName);
         return wi;
       }
     }
@@ -734,7 +751,7 @@ function dispatchJob(job: Job): boolean {
   // Determine required capabilities from manifest targets
   const requiredCaps: string[] = [];
   let reqCapLen = 0;
-  console.log('dispatchJob: manifest=' + JSON.stringify(job.manifest));
+  if (HUB_DEBUG) console.log('dispatchJob: manifest=' + JSON.stringify(job.manifest));
   if (job.manifest.targets) {
     const manifestTargets = job.manifest.targets;
     for (let ti = 0; ti < manifestTargets.length; ti++) {
@@ -746,12 +763,12 @@ function dispatchJob(job: Job): boolean {
     requiredCaps[0] = 'macos'; // default
     reqCapLen = 1;
   }
-  console.log('dispatchJob: reqCapLen=' + String(reqCapLen) + ' caps=' + requiredCaps[0]);
+  if (HUB_DEBUG) console.log('dispatchJob: reqCapLen=' + String(reqCapLen) + ' caps=' + requiredCaps[0]);
 
   const wi = getAvailableWorkerIdx(requiredCaps, reqCapLen);
   // Perry bug: < 0 unreliable, use === -1
   if (wi === -1) {
-    console.log('dispatchJob: no available worker');
+    if (HUB_DEBUG) console.log('dispatchJob: no available worker');
     return false;
   }
 
@@ -1303,7 +1320,7 @@ app.post('/api/v1/build', async (request: any, reply: any) => {
 
   let manifest: any;
   try {
-    manifest = JSON.parse(manifestPart.data);
+    manifest = JSON.parse(manifestPart.data); if (HUB_DEBUG) { console.log("[DBG] manifest_data_len=" + manifestPart.data.length); console.log("[DBG] manifest_data_head=" + manifestPart.data.substring(0, 80)); console.log("[DBG] manifest_data_tail=" + manifestPart.data.substring(Math.max(0, manifestPart.data.length - 80))); console.log("[DBG] parsed manifest=" + JSON.stringify(manifest)); }
   } catch (e: any) {
     reply.status(400);
     return JSON.stringify({ error: { code: 'BAD_REQUEST', message: 'Invalid manifest JSON' } });
@@ -1326,15 +1343,52 @@ app.post('/api/v1/build', async (request: any, reply: any) => {
   if (authHeader.startsWith('Bearer ')) {
     // API token auth — look up account, find or create license
     const token = authHeader.substring(7);
-    const accountId = accountsByToken.get(token);
-    if (!accountId) {
+    let accountId = accountsByToken.get(token);
+    let account = accountId ? accounts.get(accountId) : undefined;
+    if (!accountId || !account) {
+      // Fallback to a direct DB lookup. The in-memory accountsByToken /
+      // accounts maps are populated by initDb()'s async loop, which under
+      // perry#393 can fail to resolve its first await db.query() — leaving
+      // the maps empty even though the rows exist. Hit the DB directly so
+      // valid tokens still authenticate.
+      try {
+        // Tokens are 36-char hex UUIDs from registration; sanity-check before
+        // string concat. Avoids the (HY000) 1835 "Malformed communication packet"
+        // failure observed with mysql2 prepared-statement param binding under
+        // perry HEAD codegen.
+        const tokenSafe = token.length <= 64 && /^[A-Za-z0-9-]+$/.test(token) ? token : "";
+        const result = tokenSafe
+          ? await db.query(
+              "SELECT id, github_username, github_id, email, tier, polar_customer_id, polar_subscription_id, api_token, has_payment_method, created_at FROM accounts WHERE api_token = '" + tokenSafe + "'"
+            )
+          : [[]];
+        const rows: any = result[0];
+        if (rows && rows.length > 0) {
+          const ar = rows[0];
+          account = {
+            id: ar.id,
+            github_username: ar.github_username,
+            github_id: ar.github_id,
+            email: ar.email || '',
+            tier: ar.tier,
+            polar_customer_id: ar.polar_customer_id || '',
+            polar_subscription_id: ar.polar_subscription_id || '',
+            api_token: ar.api_token || '',
+            has_payment_method: ar.has_payment_method ? true : false,
+            created_at: ar.created_at,
+          };
+          accountId = account.id;
+          // Cache for future requests in case initDb eventually populates.
+          accounts.set(account.id, account);
+          if (account.api_token) accountsByToken.set(account.api_token, account.id);
+        }
+      } catch (e: any) {
+        console.error('auth DB fallback error:', e.message || e);
+      }
+    }
+    if (!accountId || !account) {
       reply.status(401);
       return JSON.stringify({ error: { code: 'AUTH_INVALID', message: 'Invalid API token' } });
-    }
-    const account = accounts.get(accountId);
-    if (!account) {
-      reply.status(401);
-      return JSON.stringify({ error: { code: 'AUTH_INVALID', message: 'Account not found' } });
     }
 
     // Find existing license linked to this account, or create one
@@ -1448,7 +1502,7 @@ app.post('/api/v1/build', async (request: any, reply: any) => {
 
   // Debug: log which credential fields are present
   const credKeys = Object.keys(credentials).filter((k: string) => credentials[k] && String(credentials[k]).length > 0);
-  console.log('Job ' + jobId + ' credential fields: ' + credKeys.join(', '));
+  if (HUB_DEBUG) console.log('Job ' + jobId + ' credential fields: ' + credKeys.join(', '));
 
   const position = enqueueJob(job);
   dbInsertBuild(job);
@@ -1610,6 +1664,7 @@ wss.on('connection', (clientHandle: any) => {
 
 // Message event: server-level, receives (clientHandle, data)
 wss.on('message', (clientHandle: any, data: any) => {
+  _diag.wsMsgs++;
   try {
   let msg: any;
   try {
@@ -2224,6 +2279,18 @@ startArtifactCleanup();
 setInterval(() => {
   gc();
 }, 30000);
+
+// Event-loop lag probe: this 1s timer fires late when the loop is blocked.
+// Logs only on lag spikes or high WS volume so it doesn't spam when idle.
+setInterval(() => {
+  const now = Date.now();
+  const lag = now - _diag.lastTick - 1000;
+  _diag.lastTick = now;
+  if (lag > 250 || _diag.wsMsgs > 50) {
+    console.log('[loop-diag] lag=' + String(lag) + 'ms ws_msgs_last_1s=' + String(_diag.wsMsgs));
+  }
+  _diag.wsMsgs = 0;
+}, 1000);
 
 // Register WS event handlers BEFORE app.listen() since it enters the event loop and never returns
 wss.on('listening', () => {
