@@ -58,15 +58,25 @@ The Azure VM auto-deallocates after 30 minutes of idle time, so compute billing 
 ```
 src/main.ts      # Entire server (single file)
 perry.toml       # Perry compiler project config
+scripts/build.sh # Guarded build entry point
 perry-hub        # Compiled binary (gitignored)
 ```
 
 ## Building
 
-Requires the [Perry compiler](https://github.com/PerryTS/perry):
+Requires the [Perry compiler](https://github.com/PerryTS/perry) version
+0.5.1026 or newer. Perry 0.5.1025 predates the runtime GC unsafe-zone fix that
+this long-running Fastify/WebSocket server needs to keep its periodic `gc()`
+safety valve effective.
 
 ```sh
-perry compile src/main.ts -o perry-hub
+scripts/build.sh
+```
+
+To build with a local Perry checkout:
+
+```sh
+PERRY=~/projects/perry/target/release/perry scripts/build.sh perry-hub
 ```
 
 ## Running

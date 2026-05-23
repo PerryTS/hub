@@ -17,13 +17,14 @@ for windows-sign).
 ```
 src/main.ts      # Entire server (single file)
 perry.toml       # Perry compiler project config
+scripts/build.sh # Guarded build entry point
 perry-hub        # Compiled binary (gitignored)
 ```
 
 ## Build & Run
 ```sh
-# Compile (requires perry compiler)
-~/projects/perry/target/release/perry compile src/main.ts -o perry-hub
+# Compile with Perry 0.5.1026+.
+PERRY=~/projects/perry/target/release/perry scripts/build.sh perry-hub
 
 # Run
 ./perry-hub
@@ -41,6 +42,8 @@ limitations that heavily influence code style:
 - **No binary data in HTTP bodies** — pass file paths instead
 - **`crypto.randomUUID()`** instead of `crypto.randomBytes().toString('hex')`
 - **WebSocket**: use server-level events (`wss.on`), not per-connection (`ws.on`)
+- **Build through `scripts/build.sh`** so hub cannot be rebuilt with Perry
+  0.5.1025's GC unsafe-zone runtime regression.
 
 See memory file `perry-quirks.md` for the full list.
 
