@@ -1549,6 +1549,78 @@ app.get('/api/v1/dl/:token', async (request: any, reply: any) => {
   }
 });
 
+// Authenticate a headless (CLI/CI) request by its API token (Bearer). The same
+// token used for `perry publish` (~/.perry/config.toml `api_token`).
+function headlessAuthOk(request: any): boolean {
+  const auth = request.headers['authorization'] || '';
+  if (!auth.startsWith('Bearer ')) return false;
+  const token = auth.slice(7).trim();
+  return !!token && accountsByToken.has(token);
+}
+
+// GET /api/v1/jobs/:jobId/status — headless poll of a job's state. Lets a CI run
+// enqueue with `perry publish`, then poll by Job ID without holding a WebSocket
+// open. Reports `completed` (with the artifact URL) the moment the artifact is
+// on disk — which also survives a hub restart.
+app.get('/api/v1/jobs/:jobId/status', async (request: any, reply: any) => {
+  reply.header('Content-Type', 'application/json');
+  if (!headlessAuthOk(request)) {
+    reply.status(401);
+    return JSON.stringify({ error: { code: 'AUTH_INVALID', message: 'Bearer API token required' } });
+  }
+  const jobId = request.params.jobId;
+  const recPath = ARTIFACT_DIR + '/job-' + jobId + '.json';
+  if (fs.existsSync(recPath)) {
+    let rec: any = {};
+    try { rec = JSON.parse(fs.readFileSync(recPath, 'utf8')); } catch (e) { /* keep defaults */ }
+    return JSON.stringify({
+      job_id: jobId,
+      status: 'completed',
+      artifact_ready: true,
+      artifact_name: rec.name,
+      size: rec.size,
+      sha256: rec.sha256,
+      artifact_url: getPublicUrl() + '/api/v1/jobs/' + jobId + '/artifact',
+    });
+  }
+  const job = jobs.get(jobId);
+  if (job) {
+    return JSON.stringify({ job_id: jobId, status: job.status, artifact_ready: false });
+  }
+  reply.status(404);
+  return JSON.stringify({ error: { code: 'JOB_NOT_FOUND', message: 'Job not found — it may have expired, or been lost on a hub restart while queued. Re-run the publish.' } });
+});
+
+// GET /api/v1/jobs/:jobId/artifact — headless download of the final artifact by
+// Job ID (base64 text body, like /api/v1/dl). Survives a hub restart.
+app.get('/api/v1/jobs/:jobId/artifact', async (request: any, reply: any) => {
+  if (!headlessAuthOk(request)) {
+    reply.status(401);
+    reply.header('Content-Type', 'application/json');
+    return JSON.stringify({ error: { code: 'AUTH_INVALID', message: 'Bearer API token required' } });
+  }
+  const jobId = request.params.jobId;
+  const recPath = ARTIFACT_DIR + '/job-' + jobId + '.json';
+  if (!fs.existsSync(recPath)) {
+    reply.status(404);
+    reply.header('Content-Type', 'application/json');
+    return JSON.stringify({ error: { code: 'ARTIFACT_NOT_READY', message: 'No artifact for this job yet (still queued/building, or job not found)' } });
+  }
+  let rec: any = {};
+  try { rec = JSON.parse(fs.readFileSync(recPath, 'utf8')); } catch (e) { /* keep defaults */ }
+  try {
+    const b64 = fs.readFileSync(rec.b64Path, 'utf8');
+    reply.header('Content-Type', 'text/plain');
+    const safeName = String(rec.name || 'artifact').replace(/[^a-zA-Z0-9._-]/g, '_');
+    reply.header('Content-Disposition', 'attachment; filename="' + safeName + '"');
+    return b64;
+  } catch (e: any) {
+    reply.status(410);
+    reply.header('Content-Type', 'application/json');
+    return JSON.stringify({ error: { code: 'ARTIFACT_EXPIRED', message: 'Artifact file no longer available on the hub' } });
+  }
+});
+
 // GET /api/v1/tarball/:jobId — workers download the base64-encoded tarball for a job
 app.get('/api/v1/tarball/:jobId', async (request: any, reply: any) => {
   const jobId = request.params.jobId;
@@ -1634,6 +1706,28 @@ app.post('/api/v1/artifact/upload/:jobId', async (request: any, reply: any) => {
 
   // Track artifact path for verification
   verifyArtifactPathMap.set(jobId, artifactPath);
+
+  // Headless fetch (no WebSocket): persist a job-id-keyed record so the final
+  // artifact can be polled + downloaded by Job ID over HTTP and survives a hub
+  // restart. Skip the intermediate *-precompiled bundles (those go to sign-only
+  // workers; the signed re-upload is the CLI-facing final and gets recorded).
+  if (!String(target).endsWith('-precompiled')) {
+    try {
+      fs.writeFileSync(
+        ARTIFACT_DIR + '/job-' + jobId + '.json',
+        JSON.stringify({
+          jobId: jobId,
+          name: artifactName,
+          sha256: sha256,
+          size: size,
+          b64Path: artifactPath + '.b64',
+          ts: Date.now(),
+        })
+      );
+    } catch (e) {
+      /* best-effort — the WS path still delivers the artifact */
+    }
+  }
 
   console.log('Artifact uploaded for job ' + jobId + ': ' + artifactName + ' (' + String(size) + ' bytes)');
 
