@@ -219,6 +219,36 @@ function jsonEscape(s: string): string {
   return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r/g, '\\r').replace(/\n/g, '\\n');
 }
 
+// Reduce a worker-supplied artifact filename to a bare, traversal-free base
+// name before relaying it to CLI clients. The client joins this onto its local
+// output directory, so a name like "../../.ssh/authorized_keys" would let a
+// compromised worker write outside that directory on the client
+// (GHSA-x55v-q459-68ch). The hub must never emit a name it would not itself
+// accept. Charset matches the Content-Disposition sanitizer used on the HTTP
+// download path.
+function sanitizeArtifactName(name: string): string {
+  const raw = String(name || '').trim();
+  const base = raw.split(/[\\/]/).pop() || '';
+  if (!base || base === '.' || base === '..') return 'artifact';
+  const cleaned = base.replace(/[^a-zA-Z0-9._-]/g, '_');
+  return cleaned || 'artifact';
+}
+
+// Whether a worker-supplied artifact path is genuinely contained within
+// ARTIFACT_DIR. A plain `startsWith` check is bypassable with `..` segments
+// (e.g. "/tmp/perry-artifacts/../../etc/passwd"), which would let a compromised
+// worker have the hub serve any local file as a downloadable artifact
+// (GHSA-x55v-q459-68ch, server-side). Reject any `.`/`..` path component.
+function isInsideArtifactDir(p: string): boolean {
+  if (!p.startsWith(ARTIFACT_DIR + '/')) return false;
+  const rest = p.slice(ARTIFACT_DIR.length + 1);
+  const segs = rest.split('/');
+  for (let i = 0; i < segs.length; i++) {
+    if (segs[i] === '..' || segs[i] === '.' || segs[i] === '') return false;
+  }
+  return true;
+}
+
 // Use Maps for worker property lookup (perry workaround: reading properties from
 // objects stored in module-level arrays is unreliable)
 const workerCapMap = new Map<string, string>(); // "w0" -> ",macos,ios,android,"
@@ -539,16 +569,24 @@ function reportOverageIfNeeded(licenseKey: string): void {
   const meterId = process.env.POLAR_METER_PUBLISH || '';
   if (!meterId) return;
 
+  // Use fetch rather than shelling out to curl: customer_id comes from account
+  // data and must never be interpolated into a shell command (CWE-78). Values
+  // travel as JSON / header fields, so there is no shell to inject into.
   try {
-    child_process.exec(
-      'curl -s -X POST "https://api.polar.sh/v1/events" -H "Authorization: Bearer ' + polarToken + '" -H "Content-Type: application/json" -d \'{"customer_id":"' + account.polar_customer_id + '","meter_id":"' + meterId + '","value":1}\'',
-      { timeout: 10000 },
-      (error: any, stdout: any, stderr: any) => {
-        if (error) {
-          console.error('Polar overage report failed: ' + (error.message || error));
-        }
-      }
-    );
+    fetch('https://api.polar.sh/v1/events', {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + polarToken,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        customer_id: account.polar_customer_id,
+        meter_id: meterId,
+        value: 1,
+      }),
+    }).catch((e: any) => {
+      console.error('Polar overage report failed: ' + (e && e.message ? e.message : e));
+    });
   } catch (e: any) {
     console.error('Polar overage report error: ' + (e.message || e));
   }
@@ -1588,7 +1626,7 @@ app.post('/api/v1/artifact/upload/:jobId', async (request: any, reply: any) => {
     return JSON.stringify({ error: { code: 'FORBIDDEN', message: 'Invalid job token' } });
   }
   const hdrs = request.headers;
-  const artifactName = hdrs['x-artifact-name'] || 'artifact';
+  const artifactName = sanitizeArtifactName(hdrs['x-artifact-name'] || 'artifact');
   const sha256 = hdrs['x-artifact-sha256'] || '';
   const target = hdrs['x-artifact-target'] || '';
 
@@ -1900,23 +1938,24 @@ function handleWorkerMessageByIdx(msg: any, wIdx: number): void {
     const job = jobs.get(jobId);
     if (!job) return;
 
-    // Validate path is within ARTIFACT_DIR to prevent path traversal
+    // Validate path is genuinely within ARTIFACT_DIR (rejects `..` traversal).
     const artPath = String(msg.path || '');
-    if (!artPath.startsWith(ARTIFACT_DIR + '/')) {
+    if (!isInsideArtifactDir(artPath)) {
       console.error('artifact_ready: rejected path traversal attempt: ' + artPath);
       return;
     }
 
+    const artifactName = sanitizeArtifactName(msg.artifact_name);
     const token = registerArtifact(
       artPath,
-      msg.artifact_name,
+      artifactName,
       msg.sha256,
       msg.size,
     );
     const downloadUrl = getPublicUrl() + '/api/v1/dl/' + token;
     const target = msg.target || '';
 
-    const artJson = '{"type":"artifact_ready","job_id":"' + jsonEscape(jobId) + '","target":"' + jsonEscape(target) + '","artifact_name":"' + jsonEscape(msg.artifact_name) + '","artifact_size":' + String(msg.size) + ',"sha256":"' + jsonEscape(msg.sha256) + '","download_url":"' + jsonEscape(downloadUrl) + '","expires_in_secs":' + String(ARTIFACT_TTL_SECS) + '}';
+    const artJson = '{"type":"artifact_ready","job_id":"' + jsonEscape(jobId) + '","target":"' + jsonEscape(target) + '","artifact_name":"' + jsonEscape(artifactName) + '","artifact_size":' + String(msg.size) + ',"sha256":"' + jsonEscape(msg.sha256) + '","download_url":"' + jsonEscape(downloadUrl) + '","expires_in_secs":' + String(ARTIFACT_TTL_SECS) + '}';
     relayToCliClientsJson(jobId, artJson);
   } else if (msgType === 'build_complete') {
     // Worker finished building but has a distribution step waiting for verification
