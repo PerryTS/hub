@@ -988,6 +988,21 @@ try { fs.mkdirSync(TARBALL_DIR, { recursive: true }); } catch (e) { /* exists */
 try { fs.mkdirSync(ARTIFACT_DIR, { recursive: true }); } catch (e) { /* exists */ }
 initDb();
 
+// Write a (potentially very large) base64 string to disk in sub-threshold
+// chunks. perry's `fs.writeFileSync(path, hugeString)` corrupts strings above
+// ~16 MB (it writes the string's internal length-prefixed representation and
+// truncates the tail — observed as a 12-byte header + missing bytes on >15 MB
+// artifacts). Appending ≤4 MB slices keeps every individual write well under
+// the threshold, so the assembled file is byte-exact. Used for all artifact /
+// tarball base64 persistence that downstream HTTP downloads read back.
+const B64_WRITE_CHUNK = 4 * 1024 * 1024;
+function writeB64File(path: string, data: string): void {
+  fs.writeFileSync(path, ''); // truncate / create
+  for (let i = 0; i < data.length; i += B64_WRITE_CHUNK) {
+    fs.appendFileSync(path, data.slice(i, i + B64_WRITE_CHUNK));
+  }
+}
+
 // --- Fastify HTTP server ---
 
 // 400MB body limit to accommodate base64-encoded tarballs (~33% overhead over binary)
@@ -1485,7 +1500,7 @@ app.post('/api/v1/build', async (request: any, reply: any) => {
   // Save tarball base64 to disk so workers can download it
   const jobId = crypto.randomUUID();
   const tarballB64Path = TARBALL_DIR + '/' + jobId + '.b64';
-  fs.writeFileSync(tarballB64Path, tarballB64Part.data);
+  writeB64File(tarballB64Path, tarballB64Part.data);
 
   // Create and enqueue job
   const job: Job = {
@@ -1687,8 +1702,9 @@ app.post('/api/v1/artifact/upload/:jobId', async (request: any, reply: any) => {
   const artifactPath = ARTIFACT_DIR + '/' + artifactId;
   const buffer = Buffer.from(b64Data, 'base64');
   fs.writeFileSync(artifactPath, buffer);
-  // Save base64 for verification submission
-  fs.writeFileSync(artifactPath + '.b64', b64Data);
+  // Save base64 for verification submission + headless HTTP download. Chunked
+  // write — a single writeFileSync of a >16 MB string corrupts (see writeB64File).
+  writeB64File(artifactPath + '.b64', b64Data);
   const size = buffer.length;
 
   // Register artifact with download token
@@ -2075,10 +2091,10 @@ function handleWorkerMessageByIdx(msg: any, wIdx: number): void {
           // Use 'utf8' to avoid perry's Buffer-typed read 4-byte offset bug.
           if (fs.existsSync(precompiledB64Path)) {
             const b64Data = fs.readFileSync(precompiledB64Path, 'utf8');
-            fs.writeFileSync(tarballB64Path, b64Data);
+            writeB64File(tarballB64Path, b64Data);
           } else if (fs.existsSync(precompiledPath)) {
             const b64Data = fs.readFileSync(precompiledPath, 'utf8');
-            fs.writeFileSync(tarballB64Path, b64Data);
+            writeB64File(tarballB64Path, b64Data);
           }
         } catch (e: any) {
           console.error('Failed to prepare precompiled bundle for finishing: ' + (e.message || e));
