@@ -251,6 +251,9 @@ jobs:
           [app]
           name = "hub-canary"
           version = "0.0.1"
+
+          [linux]
+          format = "binary"
           EOF
           cat > src/main.ts <<'EOF'
           console.log('hub-canary-ok');
