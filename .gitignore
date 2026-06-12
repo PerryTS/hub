@@ -3,3 +3,4 @@
 /test_ws.ts
 deploy.sh
 package.json
+.perry-cache/
