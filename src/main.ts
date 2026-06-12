@@ -85,6 +85,11 @@ function parseMultipart(body: string, contentType: string): MultipartPart[] {
 
 // --- Configuration ---
 
+// Rewritten by CI at release time (sed in .github/workflows/release.yml) so
+// /api/v1/status reports which hub build is live — the post-deploy check
+// asserts this matches the release tag to prove the binary swap took effect.
+const HUB_VERSION = '0.0.0-dev';
+
 const HTTP_PORT = parseInt(process.env.PERRY_HUB_HTTP_PORT || '3456', 10);
 const WS_PORT = parseInt(process.env.PERRY_HUB_WS_PORT || '3457', 10);
 const ARTIFACT_TTL_SECS = parseInt(process.env.PERRY_HUB_ARTIFACT_TTL_SECS || '600', 10);
@@ -1054,7 +1059,7 @@ function getPublicUrl(): string {
 // GET /api/v1/status
 app.get('/api/v1/status', async (request: any, reply: any) => {
   reply.header('Content-Type', 'application/json');
-  return '{"status":"ok","queue_length":' + String(counters.queueLen) + ',"perry_version":"0.1.0","expected_perry_version":"' + jsonEscape(perryExpected.version) + '","supported_targets":' + cached.targetsJson + ',"connected_workers":' + String(counters.workers) + '}';
+  return '{"status":"ok","hub_version":"' + jsonEscape(HUB_VERSION) + '","queue_length":' + String(counters.queueLen) + ',"perry_version":"0.1.0","expected_perry_version":"' + jsonEscape(perryExpected.version) + '","supported_targets":' + cached.targetsJson + ',"connected_workers":' + String(counters.workers) + '}';
 });
 
 // POST /api/v1/admin/update-perry — trigger perry compiler update on all workers

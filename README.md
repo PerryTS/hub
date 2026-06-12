@@ -69,6 +69,34 @@ Requires the [Perry compiler](https://github.com/PerryTS/perry):
 perry compile src/main.ts -o perry-hub
 ```
 
+## Releasing (self-build pipeline)
+
+Publishing a GitHub release runs `.github/workflows/release.yml`: the hub
+builds **itself** through its own pipeline (`perry publish linux` against the
+live hub → linux worker → binary back to CI), then deploys behind layered
+gates:
+
+1. `perry check` before anything is built remotely
+2. the built binary is **booted and probed on the CI runner**
+   (`deploy/smoke-test.sh`: status endpoint, version stamp, WS upgrade
+   handshake, admin-auth rejection, no crash)
+3. on-server atomic swap via `deploy/swap-hub.sh` — health-gated, with
+   **automatic rollback** to the previous binary on failure (last 5 backups
+   kept as `/opt/perry-hub/perry-hub.bak.<ts>`)
+4. external health + `hub_version` check from the public URL
+5. a **canary publish**: a tiny project is built through the freshly
+   deployed hub to prove it can still dispatch jobs (i.e. it could build its
+   own next release)
+
+Required repo secrets: `PERRY_LICENSE_KEY`, `PERRY_API_TOKEN`,
+`DEPLOY_SSH_KEY`, `DEPLOY_KNOWN_HOSTS` (the latter two are the same pair the
+bloom/jump web deploy uses for `webserver.skelpo.net`).
+
+**Bootstrap escape hatch:** if a bad deploy ever leaves the hub unable to
+build anything (so this pipeline can't build the fix), `./deploy.sh` still
+compiles on the linux worker over SSH with no hub involvement — keep it
+working.
+
 ## Running
 
 ```sh

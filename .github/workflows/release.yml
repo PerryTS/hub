@@ -1,0 +1,279 @@
+name: Release hub (self-build via perry publish)
+
+# The hub builds ITSELF through its own pipeline: `perry publish linux` from
+# this workflow goes to the LIVE hub at hub.perryts.com, which dispatches the
+# compile to the linux worker and returns the binary to this runner. The
+# binary is then smoke-tested ON THE RUNNER, and only if it boots and serves
+# is it shipped to the hub server, where deploy/swap-hub.sh swaps it in
+# behind a health gate with automatic rollback. A post-deploy canary publish
+# proves the NEW hub can still dispatch builds — i.e. it could build its own
+# next release.
+#
+# Failure containment, in order:
+#   perry check fails            → nothing was built, prod untouched
+#   remote build fails           → prod untouched
+#   runner smoke test fails      → prod untouched
+#   swap health gate fails       → swap-hub.sh auto-rolls back to the backup
+#   canary publish fails         → loud failure + printed rollback one-liner
+#                                  (no auto-rollback: a canary failure can be
+#                                  a worker problem, not a hub problem)
+#
+# Last-resort bypass (hub too broken to build anything, rollback failed):
+# ./deploy.sh — compiles on the worker over SSH, no hub involved.
+#
+# Required repo secrets:
+#   PERRY_LICENSE_KEY / PERRY_API_TOKEN   — perry hub auth (same as jump etc.)
+#   DEPLOY_SSH_KEY / DEPLOY_KNOWN_HOSTS   — root SSH to webserver.skelpo.net
+#                                           (same pair the jump web deploy uses)
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Never let two releases interleave a deploy.
+concurrency:
+  group: hub-deploy
+  cancel-in-progress: false
+
+env:
+  HUB_HOST: root@webserver.skelpo.net
+  HUB_URL: https://hub.perryts.com
+
+jobs:
+  # ───────────────────────────────────────────────────────────────
+  # Build the new hub through the live hub, then prove the binary
+  # actually runs before it can go anywhere near production.
+  # ───────────────────────────────────────────────────────────────
+  build-and-test:
+    name: Build via live hub + smoke test
+    runs-on: ubuntu-latest
+    services:
+      # The hub's mysql2 pool connects lazily and the smoke probes don't
+      # query, but a real server on the expected port keeps the smoke
+      # environment honest if startup behavior ever changes.
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: perry_hub
+          MYSQL_USER: perry
+          MYSQL_PASSWORD: smoke
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h localhost"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install perry
+        run: |
+          mkdir -p /tmp/perry-install
+          PERRY_TAG=$(for t in $(gh release list --repo PerryTS/perry --exclude-drafts --limit 15 --json tagName --jq '.[].tagName'); do gh release view "$t" --repo PerryTS/perry --json assets --jq '.assets[].name' 2>/dev/null | grep -q 'perry-linux-x86_64.tar.gz' && { echo "$t"; break; }; done)
+          echo "Installing perry $PERRY_TAG"
+          gh release download "$PERRY_TAG" --repo PerryTS/perry --pattern 'perry-linux-x86_64.tar.gz' --dir /tmp/perry-install
+          tar xzf /tmp/perry-install/perry-linux-x86_64.tar.gz -C /tmp/perry-install
+          sudo mv /tmp/perry-install/perry /usr/local/bin/
+          rm -rf /tmp/perry-install
+          perry --version
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            # workflow_dispatch off a branch: synthesize a unique version so
+            # the post-deploy hub_version assertion still distinguishes this
+            # binary from the previous one.
+            VERSION="0.0.0-manual.${GITHUB_RUN_NUMBER}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Releasing hub version $VERSION"
+
+      - name: Pre-build validation (perry check)
+        run: perry check src/main.ts
+
+      - name: Configure perry
+        run: |
+          mkdir -p ~/.perry
+          printf 'license_key = "%s"\nserver = "https://hub.perryts.com"\napi_token = "%s"\n' \
+            "$PERRY_LICENSE_KEY" "$PERRY_API_TOKEN" > ~/.perry/config.toml
+        env:
+          PERRY_LICENSE_KEY: ${{ secrets.PERRY_LICENSE_KEY }}
+          PERRY_API_TOKEN: ${{ secrets.PERRY_API_TOKEN }}
+
+      - name: Stamp version into perry.toml and main.ts
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          sed -i "s/^version = .*/version = \"$VERSION\"/" perry.toml
+          sed -i "s/^const HUB_VERSION = .*/const HUB_VERSION = '$VERSION';/" src/main.ts
+          grep "const HUB_VERSION" src/main.ts
+
+      - name: Build hub through the live hub (perry publish linux)
+        run: perry publish linux
+
+      - name: Locate built binary
+        run: |
+          BIN=""
+          for f in $(find dist -maxdepth 2 -type f 2>/dev/null); do
+            if file "$f" | grep -q 'ELF 64-bit'; then BIN="$f"; break; fi
+          done
+          if [ -z "$BIN" ]; then
+            echo "::error::No ELF binary found in dist/ after perry publish linux"
+            ls -laR dist/ 2>/dev/null || true
+            exit 1
+          fi
+          echo "Built binary: $BIN ($(file -b "$BIN"))"
+          mkdir -p out && cp "$BIN" out/perry-hub
+          chmod +x out/perry-hub
+
+      - name: Smoke test the new binary on this runner
+        run: ./deploy/smoke-test.sh out/perry-hub "${{ steps.version.outputs.version }}"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: perry-hub-${{ steps.version.outputs.version }}
+          path: out/perry-hub
+          retention-days: 30
+          if-no-files-found: error
+
+  # ───────────────────────────────────────────────────────────────
+  # Ship + atomic swap behind the on-server health gate.
+  # ───────────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy (health-gated swap, auto-rollback)
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: perry-hub-${{ needs.build-and-test.outputs.version }}
+          path: out
+
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          echo "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          echo 'IdentityFile ~/.ssh/deploy_key' >> ~/.ssh/config
+          echo 'UserKnownHostsFile ~/.ssh/known_hosts' >> ~/.ssh/config
+
+      - name: Upload binary + swap script to hub server
+        run: |
+          scp out/perry-hub "$HUB_HOST:/opt/perry-hub/perry-hub.new"
+          scp deploy/swap-hub.sh "$HUB_HOST:/opt/perry-hub/swap-hub.sh"
+          ssh "$HUB_HOST" "chmod +x /opt/perry-hub/swap-hub.sh"
+
+      - name: Swap with health gate (auto-rollback on failure)
+        run: |
+          ssh "$HUB_HOST" "/opt/perry-hub/swap-hub.sh /opt/perry-hub/perry-hub.new '${{ needs.build-and-test.outputs.version }}'"
+
+      - name: External health + version check
+        run: |
+          VERSION="${{ needs.build-and-test.outputs.version }}"
+          for i in $(seq 1 12); do
+            BODY=$(curl -sf -m 10 "$HUB_URL/api/v1/status" 2>/dev/null) && \
+              echo "$BODY" | grep -q '"status":"ok"' && \
+              echo "$BODY" | grep -q "\"hub_version\":\"$VERSION\"" && \
+              { echo "Live from the internet: $BODY"; exit 0; }
+            sleep 5
+          done
+          echo "::error::Hub is not reporting healthy version $VERSION from the public URL"
+          exit 1
+
+  # ───────────────────────────────────────────────────────────────
+  # Canary: the new hub must still be able to do its one job —
+  # dispatch a build to a worker and return a working artifact.
+  # (This is exactly what building the NEXT hub release will need.)
+  # ───────────────────────────────────────────────────────────────
+  canary:
+    name: Canary publish through the new hub
+    needs: [build-and-test, deploy]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install perry
+        run: |
+          mkdir -p /tmp/perry-install
+          PERRY_TAG=$(for t in $(gh release list --repo PerryTS/perry --exclude-drafts --limit 15 --json tagName --jq '.[].tagName'); do gh release view "$t" --repo PerryTS/perry --json assets --jq '.assets[].name' 2>/dev/null | grep -q 'perry-linux-x86_64.tar.gz' && { echo "$t"; break; }; done)
+          gh release download "$PERRY_TAG" --repo PerryTS/perry --pattern 'perry-linux-x86_64.tar.gz' --dir /tmp/perry-install
+          tar xzf /tmp/perry-install/perry-linux-x86_64.tar.gz -C /tmp/perry-install
+          sudo mv /tmp/perry-install/perry /usr/local/bin/
+          perry --version
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Configure perry
+        run: |
+          mkdir -p ~/.perry
+          printf 'license_key = "%s"\nserver = "https://hub.perryts.com"\napi_token = "%s"\n' \
+            "$PERRY_LICENSE_KEY" "$PERRY_API_TOKEN" > ~/.perry/config.toml
+        env:
+          PERRY_LICENSE_KEY: ${{ secrets.PERRY_LICENSE_KEY }}
+          PERRY_API_TOKEN: ${{ secrets.PERRY_API_TOKEN }}
+
+      - name: Wait for workers to reconnect to the new hub
+        run: |
+          for i in $(seq 1 18); do
+            BODY=$(curl -sf -m 10 "$HUB_URL/api/v1/status" 2>/dev/null) || BODY=""
+            WORKERS=$(echo "$BODY" | grep -o '"connected_workers":[0-9]*' | grep -o '[0-9]*$' || echo 0)
+            if [ "${WORKERS:-0}" -ge 1 ]; then
+              echo "Workers reconnected: $WORKERS"
+              exit 0
+            fi
+            echo "connected_workers=$WORKERS, waiting... ($i/18)"
+            sleep 10
+          done
+          echo "::error::No workers reconnected to the new hub within 3 minutes"
+          exit 1
+
+      - name: Canary publish (tiny project through the new hub)
+        run: |
+          mkdir -p /tmp/hub-canary/src && cd /tmp/hub-canary
+          cat > perry.toml <<EOF
+          [project]
+          name = "hub-canary"
+          entry = "src/main.ts"
+
+          [app]
+          name = "hub-canary"
+          version = "0.0.1"
+          EOF
+          cat > src/main.ts <<'EOF'
+          console.log('hub-canary-ok');
+          EOF
+          perry publish linux
+          BIN=""
+          for f in $(find dist -maxdepth 2 -type f 2>/dev/null); do
+            if file "$f" | grep -q 'ELF 64-bit'; then BIN="$f"; break; fi
+          done
+          [ -n "$BIN" ] || { echo "::error::Canary build produced no binary"; ls -laR dist/ || true; exit 1; }
+          chmod +x "$BIN"
+          OUT=$("$BIN")
+          echo "Canary output: $OUT"
+          echo "$OUT" | grep -q 'hub-canary-ok' || { echo "::error::Canary binary did not run correctly"; exit 1; }
+          echo "Canary PASS — the new hub can build and return working artifacts."
+
+      - name: Rollback instructions on canary failure
+        if: failure()
+        run: |
+          echo "::error::Canary failed. The new hub is live and externally healthy but could not complete a build round-trip."
+          echo "Investigate worker connectivity first (a canary failure can be a worker issue, not a hub issue)."
+          echo ""
+          echo "Manual rollback (restores the newest backup):"
+          echo "  ssh $HUB_HOST 'cd /opt/perry-hub && cp -p \$(ls -1t perry-hub.bak.* | head -1) perry-hub && systemctl restart perry-hub'"
+          echo ""
+          echo "Full bypass if the hub cannot build anything: run ./deploy.sh from the repo (compiles on the worker over SSH, no hub involved)."
