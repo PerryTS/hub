@@ -5,3 +5,8 @@ entry = "src/main.ts"
 [app]
 name = "perry-hub"
 version = "0.1.0"
+
+[linux]
+# Bare executable, not an AppImage — the hub is a server daemon, and the
+# worker's appimagetool path also requires a desktop icon we don't have.
+format = "binary"
