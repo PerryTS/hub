@@ -1609,8 +1609,15 @@ app.get('/api/v1/dl/:token', async (request: any, reply: any) => {
 
 // Authenticate a headless (CLI/CI) request by its API token (Bearer). The same
 // token used for `perry publish` (~/.perry/config.toml `api_token`).
-function headlessAuthOk(request: any): boolean {
-  const auth = request.headers['authorization'] || '';
+// Takes the Authorization header STRING, not the request object: when perry
+// compiles with a Rust toolchain visible (the worker docker pipeline does),
+// auto-optimize rebuilds variant runtime/ext libs, and that variant fastify
+// (perry 0.5.1159) loses the request's properties across a function-call
+// boundary — request.headers is undefined inside a helper → these routes
+// 500'd. The prebuilt release libs don't have the bug. Reading headers
+// inline in the handler scope works in every mode; never pass `request`
+// into helper functions.
+function headlessAuthOk(auth: string): boolean {
   if (!auth.startsWith('Bearer ')) return false;
   const token = auth.slice(7).trim();
   return !!token && accountsByToken.has(token);
@@ -1622,7 +1629,7 @@ function headlessAuthOk(request: any): boolean {
 // on disk — which also survives a hub restart.
 app.get('/api/v1/jobs/:jobId/status', async (request: any, reply: any) => {
   reply.header('Content-Type', 'application/json');
-  if (!headlessAuthOk(request)) {
+  if (!headlessAuthOk(request.headers['authorization'] || '')) {
     reply.status(401);
     return JSON.stringify({ error: { code: 'AUTH_INVALID', message: 'Bearer API token required' } });
   }
@@ -1652,7 +1659,7 @@ app.get('/api/v1/jobs/:jobId/status', async (request: any, reply: any) => {
 // GET /api/v1/jobs/:jobId/artifact — headless download of the final artifact by
 // Job ID (base64 text body, like /api/v1/dl). Survives a hub restart.
 app.get('/api/v1/jobs/:jobId/artifact', async (request: any, reply: any) => {
-  if (!headlessAuthOk(request)) {
+  if (!headlessAuthOk(request.headers['authorization'] || '')) {
     reply.status(401);
     reply.header('Content-Type', 'application/json');
     return JSON.stringify({ error: { code: 'AUTH_INVALID', message: 'Bearer API token required' } });

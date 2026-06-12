@@ -100,6 +100,16 @@ CODE=$(curl -s -o /dev/null -w '%{http_code}' -m 5 -X POST \
   "http://127.0.0.1:${PERRY_HUB_HTTP_PORT}/api/v1/admin/update-perry")
 [ "$CODE" = "403" ] || fail "unauthenticated admin endpoint returned $CODE, expected 403"
 
+# 5b. headless job endpoints reject cleanly (401), not crash (500). Catches
+# the auto-optimize compile-mode regression (perry 0.5.1159, worker docker
+# builds) where the variant fastify lost the request object's .headers
+# across a function boundary and these routes 500'd.
+for ep in "jobs/00000000-0000-0000-0000-000000000000/status" "jobs/00000000-0000-0000-0000-000000000000/artifact"; do
+  CODE=$(curl -s -o /dev/null -w '%{http_code}' -m 5 \
+    "http://127.0.0.1:${PERRY_HUB_HTTP_PORT}/api/v1/$ep")
+  [ "$CODE" = "401" ] || fail "unauthenticated /$ep returned $CODE, expected 401"
+done
+
 # 6. still alive after the probes
 sleep 2
 kill -0 "$HUB_PID" 2>/dev/null || fail "hub crashed after serving requests"
