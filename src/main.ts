@@ -93,6 +93,10 @@ const HUB_VERSION = '0.0.0-dev';
 const HTTP_PORT = parseInt(process.env.PERRY_HUB_HTTP_PORT || '3456', 10);
 const WS_PORT = parseInt(process.env.PERRY_HUB_WS_PORT || '3457', 10);
 const ARTIFACT_TTL_SECS = parseInt(process.env.PERRY_HUB_ARTIFACT_TTL_SECS || '600', 10);
+// Retention for job-keyed headless files (job-<id>.{json,bin,b64}). Far longer
+// than the token TTL since CI polls/downloads by job id, but bounded so they
+// don't leak forever.
+const JOB_FILE_TTL_MS = parseInt(process.env.PERRY_HUB_JOB_FILE_TTL_SECS || '86400', 10) * 1000;
 const WORKER_SECRET = process.env.PERRY_HUB_WORKER_SECRET || '';
 const ADMIN_SECRET = process.env.PERRY_HUB_ADMIN_SECRET || '';
 // Gate verbose per-dispatch logging. Left ungated, getAvailableWorkerIdx /
@@ -968,6 +972,22 @@ function startArtifactCleanup(): void {
         artifacts.delete(token);
       }
     }
+    // Sweep job-keyed headless files (job-<id>.{json,bin,b64}) older than
+    // JOB_FILE_TTL. These are NOT token-tracked, so without this they leak
+    // (the dir had orphaned .b64 going back weeks). 24h >> any CI poll/download
+    // window, so this never races a live download.
+    try {
+      const cutoff = now - JOB_FILE_TTL_MS;
+      const names = fs.readdirSync(ARTIFACT_DIR);
+      for (let ni = 0; ni < names.length; ni++) {
+        const name = names[ni];
+        if (name.indexOf('job-') !== 0) continue;
+        const p = ARTIFACT_DIR + '/' + name;
+        try {
+          if (fs.statSync(p).mtimeMs < cutoff) fs.unlinkSync(p);
+        } catch (e) { /* ignore individual file */ }
+      }
+    } catch (e) { /* dir missing / readdir failed — ignore */ }
     setTimeout(cleanup, 60_000);
   };
   setTimeout(cleanup, 60_000);
@@ -1673,10 +1693,36 @@ app.get('/api/v1/jobs/:jobId/artifact', async (request: any, reply: any) => {
   }
   let rec: any = {};
   try { rec = JSON.parse(fs.readFileSync(recPath, 'utf8')); } catch (e) { /* keep defaults */ }
+  const safeName = String(rec.name || 'artifact').replace(/[^a-zA-Z0-9._-]/g, '_');
+
+  // Preferred: serve the RAW binary as application/octet-stream (no base64).
+  // This is the corruption-free channel (see the upload handler note). The
+  // integrity gate below guarantees we NEVER hand back silently-corrupt bytes:
+  // if the stored raw doesn't match the worker's sha, fail loud instead.
+  if (rec.rawPath && fs.existsSync(rec.rawPath)) {
+    try {
+      const buf = fs.readFileSync(rec.rawPath);
+      if (rec.sha256) {
+        const actual = crypto.createHash('sha256').update(buf).digest('hex');
+        if (actual !== rec.sha256) {
+          reply.status(500);
+          reply.header('Content-Type', 'application/json');
+          return JSON.stringify({ error: { code: 'ARTIFACT_CORRUPT', message: 'Stored artifact failed integrity check (expected ' + rec.sha256 + ', got ' + actual + ') — rebuild and retry' } });
+        }
+      }
+      reply.header('Content-Type', 'application/octet-stream');
+      reply.header('Content-Disposition', 'attachment; filename="' + safeName + '"');
+      return buf;
+    } catch (e: any) {
+      /* fall through to the legacy base64 record */
+    }
+  }
+
+  // Legacy fallback: job records written before the raw-copy fix only have the
+  // base64 file. Kept so in-flight/old artifacts still download.
   try {
     const b64 = fs.readFileSync(rec.b64Path, 'utf8');
     reply.header('Content-Type', 'text/plain');
-    const safeName = String(rec.name || 'artifact').replace(/[^a-zA-Z0-9._-]/g, '_');
     reply.header('Content-Disposition', 'attachment; filename="' + safeName + '"');
     return b64;
   } catch (e: any) {
@@ -1778,6 +1824,30 @@ app.post('/api/v1/artifact/upload/:jobId', async (request: any, reply: any) => {
   // restart. Skip the intermediate *-precompiled bundles (those go to sign-only
   // workers; the signed re-upload is the CLI-facing final and gets recorded).
   if (!String(target).endsWith('-precompiled')) {
+    // Persist a job-keyed RAW copy and serve THAT from /artifact (octet-stream).
+    // The base64-string path (writeB64File chunked append → readFileSync utf8)
+    // intermittently corrupts the first 12 bytes of large downloads on the live
+    // server: a 4 MB chunk-size word (0x00400000) leaks into the head of the
+    // string under GC/memory pressure (reproduced on the live hub's stored .b64;
+    // not reproducible on an unloaded process — see PerryTS/perry#5038). `buffer`
+    // is decoded before any string slicing and a Buffer write has no such
+    // surface, so the raw copy is the trustworthy channel. The token /dl path
+    // still uses the .b64 (CLI verifies sha + retries); this fixes the headless
+    // poll-by-id path the CI download uses.
+    const jobBinPath = ARTIFACT_DIR + '/job-' + jobId + '.bin';
+    let rawOk = false;
+    try {
+      fs.writeFileSync(jobBinPath, buffer);
+      rawOk = true;
+    } catch (e) { /* fall back to the b64 record below */ }
+    // Diagnostic: if the decoded buffer already disagrees with the worker's
+    // sha, the corruption is upstream of storage (in-memory decode), not here.
+    if (sha256) {
+      const localSha = crypto.createHash('sha256').update(buffer).digest('hex');
+      if (localSha !== sha256) {
+        console.log('WARN artifact ' + jobId + ' decoded sha ' + localSha + ' != worker sha ' + sha256 + ' (in-memory decode corruption)');
+      }
+    }
     try {
       fs.writeFileSync(
         ARTIFACT_DIR + '/job-' + jobId + '.json',
@@ -1786,6 +1856,7 @@ app.post('/api/v1/artifact/upload/:jobId', async (request: any, reply: any) => {
           name: artifactName,
           sha256: sha256,
           size: size,
+          rawPath: rawOk ? jobBinPath : '',
           b64Path: artifactPath + '.b64',
           ts: Date.now(),
         })
