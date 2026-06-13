@@ -616,7 +616,7 @@ function generateLicenseKey(tier: 'free' | 'pro'): string {
 function registerLicense(username: string, tier: 'free' | 'pro', deviceBound: boolean): License {
   const key = generateLicenseKey(tier);
   const platforms = tier === 'pro'
-    ? ['macos', 'ios', 'android', 'windows', 'linux']
+    ? ['macos', 'ios', 'tvos', 'watchos', 'android', 'windows', 'linux']
     : ['macos'];
   const license: License = { key, tier, github_username: username, platforms, account_id: '', device_bound: deviceBound, project_bundle_id: '' };
   licenses.set(key, license);
@@ -706,11 +706,11 @@ function getWorkerCapStr(wi: number): string {
 function rebuildTargetsJson(): void {
   // Check each known target against all worker capStr entries
   // Avoid split/length comparisons entirely (broken in perry)
-  const known = [',macos,', ',ios,', ',android,', ',linux,', ',windows,'];
-  const labels = ['"macos"', '"ios"', '"android"', '"linux"', '"windows"'];
+  const known = [',macos,', ',ios,', ',tvos,', ',watchos,', ',android,', ',linux,', ',windows,'];
+  const labels = ['"macos"', '"ios"', '"tvos"', '"watchos"', '"android"', '"linux"', '"windows"'];
   let json = '[';
   let first = true;
-  for (let ki = 0; ki < 5; ki++) {
+  for (let ki = 0; ki < 7; ki++) {
     let found = false;
     for (let wi = 0; wi < counters.workers; wi++) {
       const cs = workerCapMap.get('w' + String(wi)) || ',';
@@ -1278,7 +1278,7 @@ app.post('/api/v1/account/update', async (request: any, reply: any) => {
     if (lic.account_id === body.account_id) {
       lic.tier = account.tier;
       if (account.tier === 'pro') {
-        lic.platforms = ['macos', 'ios', 'android', 'windows', 'linux'];
+        lic.platforms = ['macos', 'ios', 'tvos', 'watchos', 'android', 'windows', 'linux'];
       }
       dbSaveLicense(lic);
     }
