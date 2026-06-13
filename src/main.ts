@@ -1829,7 +1829,7 @@ app.post('/api/v1/artifact/upload/:jobId', async (request: any, reply: any) => {
     // intermittently corrupts the first 12 bytes of large downloads on the live
     // server: a 4 MB chunk-size word (0x00400000) leaks into the head of the
     // string under GC/memory pressure (reproduced on the live hub's stored .b64;
-    // not reproducible on an unloaded process — see PerryTS/perry#5038). `buffer`
+    // not reproducible on an unloaded process — see PerryTS/perry#5062). `buffer`
     // is decoded before any string slicing and a Buffer write has no such
     // surface, so the raw copy is the trustworthy channel. The token /dl path
     // still uses the .b64 (CLI verifies sha + retries); this fixes the headless
