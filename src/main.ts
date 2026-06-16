@@ -268,6 +268,15 @@ const workerActiveJobsMap = new Map<string, number>(); // "w0" -> 0
 const workerMaxConcurrentMap = new Map<string, number>(); // "w0" -> 2
 const workerJobMap = new Map<string, string>(); // "w0" -> current_job_id or ""
 const workerVersionMap = new Map<string, string>(); // "w0" -> "0.2.181"
+// Liveness tracking (zombie/half-open detection — the WS layer can't see dead
+// sockets, so we track app-level activity and reap unresponsive workers).
+const workerLastSeenMap = new Map<string, number>(); // "w0" -> last app-message ms
+const workerHeartbeatCapableMap = new Map<string, boolean>(); // "w0" -> sent a heartbeat
+const workerEvictedMap = new Map<string, boolean>(); // "w0" -> soft-evicted (dead)
+const jobDispatchedAtMap = new Map<string, number>(); // job_id -> dispatch ms
+// Watchdog thresholds.
+const JOB_ACK_TIMEOUT_MS = 120000;   // dispatched job, zero worker activity => dead worker, re-queue
+const HEARTBEAT_TIMEOUT_MS = 90000;  // heartbeat-capable worker silent this long while idle => zombie
 // Precomputed JSON string of supported targets (rebuilt on worker connect/disconnect)
 const cached = { targetsJson: '[]' };
 // Expected perry version — set via admin endpoint or env
@@ -745,6 +754,7 @@ function getAvailableWorkerIdx(requiredCaps: string[], reqLen: number): number {
   if (HUB_DEBUG) console.log('getAvailableWorkerIdx: checking ' + String(counters.workers) + ' workers for ' + String(reqLen) + ' caps');
   for (let wi = 0; wi < counters.workers; wi++) {
     const wKey = 'w' + String(wi);
+    if (workerEvictedMap.get(wKey) === true) continue; // skip soft-evicted (dead) workers
     const wName = workerNameMap.get(wKey) || '?';
     const wActive = workerActiveJobsMap.get(wKey) || 0;
     const wMaxConcurrent = workerMaxConcurrentMap.get(wKey) || 1;
@@ -827,6 +837,7 @@ function dispatchJob(job: Job): boolean {
   workerActiveJobsMap.set(wKey, (workerActiveJobsMap.get(wKey) || 0) + 1);
   workerBusyMap.set(wKey, true);
   workerJobMap.set(wKey, job.id);
+  jobDispatchedAtMap.set(job.id, Date.now());
   job.status = 'running';
   dbBuildStarted(job.id, wName);
 
@@ -1079,7 +1090,11 @@ function getPublicUrl(): string {
 // GET /api/v1/status
 app.get('/api/v1/status', async (request: any, reply: any) => {
   reply.header('Content-Type', 'application/json');
-  return '{"status":"ok","hub_version":"' + jsonEscape(HUB_VERSION) + '","queue_length":' + String(counters.queueLen) + ',"perry_version":"0.1.0","expected_perry_version":"' + jsonEscape(perryExpected.version) + '","supported_targets":' + cached.targetsJson + ',"connected_workers":' + String(counters.workers) + '}';
+  let liveWorkers = 0;
+  for (let wi = 0; wi < counters.workers; wi++) {
+    if (workerEvictedMap.get('w' + String(wi)) !== true) liveWorkers++;
+  }
+  return '{"status":"ok","hub_version":"' + jsonEscape(HUB_VERSION) + '","queue_length":' + String(counters.queueLen) + ',"perry_version":"0.1.0","expected_perry_version":"' + jsonEscape(perryExpected.version) + '","supported_targets":' + cached.targetsJson + ',"connected_workers":' + String(liveWorkers) + '}';
 });
 
 // POST /api/v1/admin/update-perry — trigger perry compiler update on all workers
@@ -1153,7 +1168,8 @@ app.get('/api/v1/admin/workers', async (request: any, reply: any) => {
     workersJson = workersJson + '{"name":"' + jsonEscape(workerNameMap.get(wKey) || '?')
       + '","perry_version":"' + jsonEscape(workerVersionMap.get(wKey) || 'unknown')
       + '","capabilities":"' + jsonEscape(workerCapMap.get(wKey) || ',')
-      + '","busy":' + String(workerBusyMap.get(wKey) || false) + '}';
+      + '","busy":' + String(workerBusyMap.get(wKey) || false)
+      + ',"evicted":' + String(workerEvictedMap.get(wKey) === true) + '}';
   }
   workersJson = workersJson + ']';
 
@@ -1948,6 +1964,9 @@ wss.on('message', (clientHandle: any, data: any) => {
       workerJobMap.set(wKey, '');
       const workerVersion = msg.perry_version || '';
       workerVersionMap.set(wKey, workerVersion);
+      workerLastSeenMap.set(wKey, Date.now());
+      workerHeartbeatCapableMap.set(wKey, false);
+      workerEvictedMap.set(wKey, false);
       setClientWorkerIdx(clientHandle, counters.workers);
       counters.workers++;
       rebuildTargetsJson();
@@ -2069,6 +2088,9 @@ wss.on('close', (clientHandle: any) => {
         workerBusyMap.set(curKey, workerBusyMap.get(nextKey) || false);
         workerJobMap.set(curKey, workerJobMap.get(nextKey) || '');
         workerVersionMap.set(curKey, workerVersionMap.get(nextKey) || '');
+        workerLastSeenMap.set(curKey, workerLastSeenMap.get(nextKey) || 0);
+        workerHeartbeatCapableMap.set(curKey, workerHeartbeatCapableMap.get(nextKey) === true);
+        workerEvictedMap.set(curKey, workerEvictedMap.get(nextKey) === true);
         setClientWorkerIdx(nextHandle, wi);
       }
       const lastKey = 'w' + String(counters.workers);
@@ -2078,6 +2100,9 @@ wss.on('close', (clientHandle: any) => {
       workerBusyMap.delete(lastKey);
       workerJobMap.delete(lastKey);
       workerVersionMap.delete(lastKey);
+      workerLastSeenMap.delete(lastKey);
+      workerHeartbeatCapableMap.delete(lastKey);
+      workerEvictedMap.delete(lastKey);
       rebuildTargetsJson();
       tryDispatchNext();
     }
@@ -2121,6 +2146,14 @@ function handleWorkerMessageByIdx(msg: any, wIdx: number): void {
   const wKey = 'w' + String(wIdx);
   const msgType = msg.type;
   const jobId = msg.job_id || workerJobMap.get(wKey) || '';
+
+  // Any app-level message proves the worker's socket is alive (the WS layer
+  // can't detect half-open/dead sockets, so this is our liveness signal).
+  workerLastSeenMap.set(wKey, Date.now());
+  if (msgType === 'heartbeat') {
+    workerHeartbeatCapableMap.set(wKey, true);
+    return;
+  }
 
   if (msgType === 'progress' || msgType === 'stage' || msgType === 'log' || msgType === 'queue_update' || msgType === 'published') {
     if (jobId) {
@@ -2496,6 +2529,97 @@ function sendVerifyResult(buildJobId: string, wIdx: number, passed: boolean, rea
   verifyWorkerIdxMap.delete(buildJobId);
   verifyStartTimeMap.delete(buildJobId);
 }
+
+// --- Worker liveness watchdog ---------------------------------------------
+// The perry WS server only fires `close` on a clean TCP close. A worker that
+// vanishes (Wi-Fi drop, half-open socket) is never detected, leaving a "zombie"
+// in the pool; getAvailableWorkerIdx picks the lowest index, so a zombie can
+// silently swallow jobs (sendToClient to a dead socket does not throw, so the
+// job is marked running and hangs forever). This watchdog catches that.
+//
+// "Soft evict": make a worker unselectable (active jobs sentinel + maxConcurrent
+// 0) and close its socket, WITHOUT the fragile array shift-down used by the
+// disconnect handler. Lingers (harmlessly, unselectable) until the next hub
+// restart clears the pool.
+function softEvictWorker(wKey: string, reason: string): void {
+  if (workerEvictedMap.get(wKey) === true) return;
+  const wName = workerNameMap.get(wKey) || '?';
+  const wHandle = workerHandleMap.get(wKey) || 0;
+  console.log('softEvictWorker: ' + wName + ' (' + wKey + ') — ' + reason);
+  try {
+    closeClient(wHandle);
+  } catch (e) {
+    // ignore — socket may already be dead
+  }
+  workerEvictedMap.set(wKey, true);
+  workerActiveJobsMap.set(wKey, 999999); // never < maxConcurrent => never selected
+  workerMaxConcurrentMap.set(wKey, 0);
+  workerBusyMap.set(wKey, true);
+  workerJobMap.set(wKey, ''); // clear so a later real `close` won't double re-queue
+  workerCapMap.set(wKey, ','); // drop from supported-targets aggregation
+}
+
+// Re-queue a job that was stranded on an evicted worker (mirrors the disconnect
+// handler's retry logic) so a live worker can pick it up.
+function requeueStrandedJob(jid: string, wName: string): void {
+  const job = jobs.get(jid);
+  if (!job || job.status !== 'running') return;
+  jobTokens.delete(jid);
+  const retries = job.retries || 0;
+  if (retries < MAX_JOB_RETRIES) {
+    job.status = 'queued';
+    job.retries = retries + 1;
+    jobQueue.unshift(job.id);
+    counters.queueLen++;
+    console.log('Watchdog re-queued job ' + job.id + ' (worker ' + wName + ' unresponsive, retry ' + String(job.retries) + '/' + String(MAX_JOB_RETRIES) + ')');
+    const rq = '{"type":"queue_update","job_id":"' + jsonEscape(job.id) + '","position":1,"message":"Worker unresponsive, re-queued (attempt ' + String(job.retries + 1) + ')"}';
+    relayToCliClientsJson(job.id, rq);
+  } else {
+    job.status = 'failed';
+    releaseRateLimit(job.license_key);
+    console.log('Job ' + job.id + ' failed after ' + String(MAX_JOB_RETRIES) + ' retries (workers unresponsive)');
+    const errJson = '{"type":"error","code":"INTERNAL_ERROR","message":"Build failed after ' + String(MAX_JOB_RETRIES) + ' attempts (workers kept going unresponsive)"}';
+    relayToCliClientsJson(job.id, errJson);
+    const completeJson = '{"type":"complete","job_id":"' + job.id + '","success":false,"duration_secs":0,"artifacts":[]}';
+    relayToCliClientsJson(job.id, completeJson);
+  }
+}
+
+setInterval(() => {
+  const now = Date.now();
+  let evicted = false;
+  for (let wi = 0; wi < counters.workers; wi++) {
+    const wKey = 'w' + String(wi);
+    if (workerEvictedMap.get(wKey) === true) continue;
+    const lastSeen = workerLastSeenMap.get(wKey) || 0;
+    const active = workerActiveJobsMap.get(wKey) || 0;
+    const jid = workerJobMap.get(wKey) || '';
+    const wName = workerNameMap.get(wKey) || '?';
+    if (active > 0 && jid !== '') {
+      // Reactive: a dispatched job whose worker has sent NOTHING since dispatch
+      // is stranded on a dead worker — evict it and re-queue the job.
+      const dispatchedAt = jobDispatchedAtMap.get(jid) || 0;
+      if (dispatchedAt > 0 && (now - dispatchedAt) > JOB_ACK_TIMEOUT_MS && lastSeen < dispatchedAt) {
+        softEvictWorker(wKey, 'no activity ' + String(now - dispatchedAt) + 'ms after dispatch of job ' + jid);
+        requeueStrandedJob(jid, wName);
+        evicted = true;
+      }
+    } else {
+      // Proactive: a worker that proved it heartbeats, then went silent while
+      // idle, is a zombie. (Gated on heartbeat-capable so workers that never
+      // heartbeat — e.g. old versions — are never falsely reaped here.)
+      const hbCapable = workerHeartbeatCapableMap.get(wKey) === true;
+      if (hbCapable && lastSeen > 0 && (now - lastSeen) > HEARTBEAT_TIMEOUT_MS) {
+        softEvictWorker(wKey, 'heartbeat silent ' + String(now - lastSeen) + 'ms while idle');
+        evicted = true;
+      }
+    }
+  }
+  if (evicted) {
+    rebuildTargetsJson();
+    tryDispatchNext();
+  }
+}, 15000);
 
 // --- Start servers ---
 
